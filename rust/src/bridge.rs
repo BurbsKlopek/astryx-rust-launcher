@@ -296,3 +296,50 @@ pub fn set_pref(key: &str, value: &str) {
         Some(())
     });
 }
+
+pub fn get_app_version() -> String {
+    with_activity(|env, act| {
+        let val = env
+            .call_method(act, "rustGetAppVersion", "()Ljava/lang/String;", &[])
+            .ok()?
+            .l()
+            .ok()?;
+        let s: String = env.get_string(&JString::from(val)).ok()?.into();
+        Some(s)
+    })
+    .filter(|s| !s.is_empty())
+    .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string())
+}
+
+pub fn get_cache_dir() -> String {
+    with_activity(|env, act| {
+        let val = env
+            .call_method(act, "rustGetCacheDir", "()Ljava/lang/String;", &[])
+            .ok()?
+            .l()
+            .ok()?;
+        let s: String = env.get_string(&JString::from(val)).ok()?.into();
+        Some(s)
+    })
+    .filter(|s| !s.is_empty())
+    .unwrap_or_else(|| "/data/user/0/com.astryxtv.rustlauncher/cache".to_string())
+}
+
+pub fn install_apk(apk_path: &str) -> String {
+    with_activity(|env, act| {
+        let jpath = env.new_string(apk_path).ok()?;
+        let val = env
+            .call_method(
+                act,
+                "rustInstallApk",
+                "(Ljava/lang/String;)Ljava/lang/String;",
+                &[JValue::Object(&jpath)],
+            )
+            .ok()?
+            .l()
+            .ok()?;
+        let s: String = env.get_string(&JString::from(val)).ok()?.into();
+        Some(s)
+    })
+    .unwrap_or_else(|| "ERR:Android JNI bridge unavailable".to_string())
+}

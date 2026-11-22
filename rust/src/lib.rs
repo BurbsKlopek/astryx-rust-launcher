@@ -2,6 +2,7 @@ mod a2ui;
 mod app;
 mod bridge;
 mod theme;
+mod updater;
 mod weather;
 
 use android_activity::AndroidApp;

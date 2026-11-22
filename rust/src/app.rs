@@ -4,6 +4,7 @@ use crate::theme::{
     AstryxThemeId, FocusAnimStyle, IconSize, LauncherConfig, LayoutStyle, SettingsViewMode,
     SortOrder, WeatherScene, ACCENT_PRESETS,
 };
+use crate::updater::{self, ReleaseInfo, UpdateCheckOutcome};
 use crate::weather::{self, WeatherData};
 use chrono::{Local, Timelike};
 use egui::{
@@ -24,6 +25,31 @@ enum BgMsg {
     WeatherLoaded(WeatherData),
     WallpaperLoaded(WeatherScene, u8, ColorImage),
     RamCleared(i32, i32), // (before_mb, after_mb)
+    UpdateChecked(UpdateCheckOutcome, bool), // (outcome, silent)
+    UpdateDownloadProgress(u64, u64),
+    UpdateDownloadDone(Result<String, String>),
+}
+
+#[derive(Debug, Clone)]
+enum UpdaterState {
+    Idle,
+    Checking,
+    UpToDate { latest: Option<String> },
+    Available(ReleaseInfo),
+    Downloading {
+        release: ReleaseInfo,
+        downloaded: u64,
+        total: u64,
+    },
+    ReadyToInstall {
+        release: ReleaseInfo,
+        apk_path: String,
+    },
+    NeedPermission {
+        release: ReleaseInfo,
+        apk_path: String,
+    },
+    Error(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,6 +68,7 @@ enum ActiveModal {
     Weather,
     Theme,
     Settings,
+    Updater,
     Search,
     A2ui,
     AppContext(String), // package_name
@@ -72,6 +99,10 @@ pub struct AstryxTvApp {
     a2ui: A2uiEngine,
     a2ui_input: String,
     a2ui_feedback: String,
+
+    // Internal OTA Updater
+    app_version: String,
+    updater_state: UpdaterState,
 
     // Navigation & Modals
     focus: FocusTarget,
@@ -175,6 +206,8 @@ impl AstryxTvApp {
             a2ui: A2uiEngine::default(),
             a2ui_input: SAMPLE_A2UI_PAYLOAD.to_string(),
             a2ui_feedback: String::new(),
+            app_version: bridge::get_app_version(),
+            updater_state: UpdaterState::Idle,
             focus: FocusTarget::App(0),
             last_app_idx: 0,
             focus_changed: false,
@@ -208,6 +241,7 @@ impl AstryxTvApp {
         app.spawn_load_status(cc.egui_ctx.clone());
         app.spawn_load_weather(cc.egui_ctx.clone());
         app.ensure_wallpaper(cc.egui_ctx.clone());
+        app.spawn_check_update(cc.egui_ctx.clone(), true);
         app
     }
 
@@ -349,6 +383,75 @@ impl AstryxTvApp {
         });
     }
 
+    fn has_update_available(&self) -> bool {
+        matches!(
+            self.updater_state,
+            UpdaterState::Available(_)
+                | UpdaterState::Downloading { .. }
+                | UpdaterState::ReadyToInstall { .. }
+                | UpdaterState::NeedPermission { .. }
+        )
+    }
+
+    fn spawn_check_update(&mut self, ctx: egui::Context, silent: bool) {
+        if matches!(
+            self.updater_state,
+            UpdaterState::Checking | UpdaterState::Downloading { .. }
+        ) {
+            return;
+        }
+        if !silent {
+            self.updater_state = UpdaterState::Checking;
+        }
+        let current = self.app_version.clone();
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let outcome = updater::check_for_update(&current);
+            let _ = tx.send(BgMsg::UpdateChecked(outcome, silent));
+            ctx.request_repaint();
+        });
+    }
+
+    fn spawn_download_update(&mut self, ctx: egui::Context, release: ReleaseInfo) {
+        if matches!(self.updater_state, UpdaterState::Downloading { .. }) {
+            return;
+        }
+        let url = release.apk_url.clone();
+        let expected_size = release.apk_size;
+        self.updater_state = UpdaterState::Downloading {
+            release,
+            downloaded: 0,
+            total: expected_size,
+        };
+        let cache_dir = bridge::get_cache_dir();
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let tx_prog = tx.clone();
+            let ctx_prog = ctx.clone();
+            let res = updater::download_apk(&url, &cache_dir, expected_size, move |dl, tot| {
+                let _ = tx_prog.send(BgMsg::UpdateDownloadProgress(dl, tot));
+                ctx_prog.request_repaint();
+            });
+            let _ = tx.send(BgMsg::UpdateDownloadDone(res));
+            ctx.request_repaint();
+        });
+    }
+
+    fn trigger_install_apk(&mut self, release: ReleaseInfo, apk_path: String) {
+        let res = bridge::install_apk(&apk_path);
+        if res == "OK" {
+            self.updater_state = UpdaterState::ReadyToInstall { release, apk_path };
+            self.show_toast("Launching Android TV installer...");
+        } else if res == "NEED_PERMISSION" {
+            self.updater_state = UpdaterState::NeedPermission { release, apk_path };
+            self.show_toast("Enable 'Install unknown apps' for Astryx, then press Install");
+        } else {
+            let msg = res.strip_prefix("ERR:").unwrap_or(&res).to_string();
+            self.updater_state = UpdaterState::Error(msg.clone());
+            self.show_toast(format!("Install error: {msg}"));
+        }
+    }
+
     fn spawn_load_weather(&mut self, ctx: egui::Context) {
         self.last_weather_poll = Instant::now();
         let tx = self.tx.clone();
@@ -470,6 +573,45 @@ impl AstryxTvApp {
                         self.show_toast("✓ RAM Optimized");
                     }
                 }
+                BgMsg::UpdateChecked(outcome, silent) => match outcome {
+                    UpdateCheckOutcome::Available(rel) => {
+                        let tag = rel.tag.clone();
+                        self.updater_state = UpdaterState::Available(rel);
+                        if silent {
+                            self.show_toast(format!("Update {tag} available — open Settings → App Updates"));
+                        }
+                    }
+                    UpdateCheckOutcome::UpToDate { latest, .. } => {
+                        if !silent || !self.has_update_available() {
+                            self.updater_state = UpdaterState::UpToDate { latest };
+                        }
+                    }
+                    UpdateCheckOutcome::Error(err) => {
+                        if !silent {
+                            self.updater_state = UpdaterState::Error(err);
+                        }
+                    }
+                },
+                BgMsg::UpdateDownloadProgress(dl, tot) => {
+                    if let UpdaterState::Downloading {
+                        downloaded, total, ..
+                    } = &mut self.updater_state
+                    {
+                        *downloaded = dl;
+                        *total = tot;
+                    }
+                }
+                BgMsg::UpdateDownloadDone(res) => match res {
+                    Ok(path) => {
+                        if let UpdaterState::Downloading { release, .. } = self.updater_state.clone() {
+                            self.trigger_install_apk(release, path);
+                        }
+                    }
+                    Err(e) => {
+                        self.updater_state = UpdaterState::Error(e.clone());
+                        self.show_toast(format!("Update failed: {e}"));
+                    }
+                },
             }
         }
     }
@@ -1458,6 +1600,23 @@ impl AstryxTvApp {
                 ));
                 p.circle_filled(c, 1.8, color);
             }
+            // App Updates: crisp downward arrow into tray
+            13 => {
+                p.line_segment([c + Vec2::new(0.0, -5.2), c + Vec2::new(0.0, 1.8)], Stroke::new(1.7_f32, color));
+                p.add(egui::Shape::line(
+                    vec![c + Vec2::new(-3.2, -0.8), c + Vec2::new(0.0, 2.2), c + Vec2::new(3.2, -0.8)],
+                    Stroke::new(1.7_f32, color),
+                ));
+                p.add(egui::Shape::line(
+                    vec![
+                        c + Vec2::new(-5.0, 2.8),
+                        c + Vec2::new(-5.0, 5.0),
+                        c + Vec2::new(5.0, 5.0),
+                        c + Vec2::new(5.0, 2.8),
+                    ],
+                    s,
+                ));
+            }
             // Device / Display: TV monitor
             100 | 202 => {
                 p.rect_stroke(Rect::from_center_size(c + Vec2::new(0.0, -1.0), Vec2::new(11.5, 7.6)), CornerRadius::same(2), s, egui::StrokeKind::Middle);
@@ -1581,8 +1740,33 @@ impl AstryxTvApp {
         let accent = self.config.accent();
         let dock_fill = self.config.dock_fill();
 
-        // Reserve compact top space; render the capsule anchored tightly top-right around the 7 icons
-        ui.add_space(40.0);
+        // Top-left: Bold UK Clock & Date anchored cleanly in the top-left corner
+        if self.config.show_header {
+            let time_str = self.cached_time_str.clone();
+            let date_str = self.cached_date_str.clone();
+            egui::Area::new(egui::Id::new("classic_top_clock"))
+                .anchor(Align2::LEFT_TOP, Vec2::new(28.0, 14.0))
+                .order(egui::Order::Middle)
+                .show(ctx, |ui| {
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 1.0;
+                        ui.label(
+                            RichText::new(&time_str)
+                                .font(FontId::proportional(40.0))
+                                .strong()
+                                .color(Color32::WHITE),
+                        );
+                        ui.label(
+                            RichText::new(&date_str)
+                                .font(FontId::proportional(13.5))
+                                .color(Color32::from_rgba_unmultiplied(230, 238, 250, 215)),
+                        );
+                    });
+                });
+        }
+
+        // Reserve top space below the top-right 7-icon capsule
+        ui.add_space(44.0);
 
         egui::Area::new(egui::Id::new("top_dock_capsule"))
             .anchor(Align2::RIGHT_TOP, Vec2::new(-28.0, 14.0))
@@ -1664,6 +1848,12 @@ impl AstryxTvApp {
                                         3.2,
                                         Color32::from_rgb(56, 189, 248),
                                     );
+                                } else if idx == 6 && self.has_update_available() {
+                                    p.circle_filled(
+                                        rect.right_top() + Vec2::new(-4.5, 4.5),
+                                        3.8,
+                                        Color32::from_rgb(52, 211, 153),
+                                    );
                                 }
 
                                 if resp.clicked() {
@@ -1711,22 +1901,7 @@ impl AstryxTvApp {
 
         ui.add_space(4.0);
         ui.horizontal(|ui| {
-            // Left: Borderless bold UK clock
-            ui.vertical(|ui| {
-                ui.label(
-                    RichText::new(&self.cached_time_str)
-                        .font(FontId::proportional(44.0))
-                        .strong()
-                        .color(Color32::WHITE),
-                );
-                ui.label(
-                    RichText::new(&self.cached_date_str)
-                        .font(FontId::proportional(14.5))
-                        .color(Color32::from_rgba_unmultiplied(230, 238, 250, 215)),
-                );
-            });
-
-            // Right: Interactive Weather Block (flush-right, wide enough so H/L/Rain stays on one line)
+            // Right: Interactive Weather Block (flush-right below top-right dock, while clock sits top-left)
             if self.config.show_weather {
                 let weather_w = 294.0;
                 let gap = (ui.available_width() - weather_w).max(16.0);
@@ -3178,9 +3353,9 @@ impl AstryxTvApp {
             }
 
             ActiveModal::Settings => {
-                // 14 settings (0..14) + row 14 = Android TV Shortcuts (4 columns)
-                const SETTING_COUNT: usize = 14;
-                const SYS_IDX: usize = 14;
+                // 15 settings (0..15, perfect 5x3 grid!) + row 15 = Android TV Shortcuts (4 columns)
+                const SETTING_COUNT: usize = 15;
+                const SYS_IDX: usize = 15;
                 const GRID_COLS: usize = 3;
                 let is_grid = self.config.settings_view == SettingsViewMode::Grid;
 
@@ -3322,6 +3497,15 @@ impl AstryxTvApp {
                         this.config.hidden_apps.clear();
                         this.save_config();
                         this.show_toast("Restored all hidden apps");
+                    }
+                    14 => {
+                        this.open_modal(ActiveModal::Updater);
+                        if matches!(
+                            this.updater_state,
+                            UpdaterState::Idle | UpdaterState::Error(_)
+                        ) {
+                            this.spawn_check_update(ctx.clone(), false);
+                        }
                     }
                     _ => {}
                 };
@@ -3524,6 +3708,19 @@ impl AstryxTvApp {
                                 format!("Unhide ({})", this.config.hidden_apps.len()),
                                 false,
                                 12,
+                            ),
+                            (
+                                "App Updates",
+                                match &this.updater_state {
+                                    UpdaterState::Available(r) => format!("v{} ›", r.version),
+                                    UpdaterState::Downloading { .. } => "Downloading".to_string(),
+                                    UpdaterState::ReadyToInstall { .. }
+                                    | UpdaterState::NeedPermission { .. } => "Install ›".to_string(),
+                                    UpdaterState::Checking => "Checking...".to_string(),
+                                    _ => format!("v{} ›", this.app_version),
+                                },
+                                this.has_update_available(),
+                                13,
                             ),
                         ];
 
@@ -4173,6 +4370,445 @@ impl AstryxTvApp {
                     self.modal = ActiveModal::None;
                 }
             }
+
+            ActiveModal::Updater => {
+                let mut action: Option<u8> = None;
+                let is_busy = matches!(
+                    self.updater_state,
+                    UpdaterState::Checking | UpdaterState::Downloading { .. }
+                );
+                if allow_keys {
+                    ctx.input(|i| {
+                        if i.key_pressed(Key::ArrowLeft) {
+                            self.modal_focus = self.modal_focus.saturating_sub(1);
+                        } else if i.key_pressed(Key::ArrowRight) {
+                            self.modal_focus = (self.modal_focus + 1).min(1);
+                        } else if i.key_pressed(Key::Enter) || i.key_pressed(Key::Space) {
+                            action = Some(self.modal_focus as u8);
+                        }
+                    });
+                }
+
+                if is_busy {
+                    ctx.request_repaint();
+                }
+
+                let state_snapshot = self.updater_state.clone();
+                let current_ver = self.app_version.clone();
+
+                self.draw_modal_shell(
+                    ctx,
+                    "Internal Updater  ·  GitHub Releases",
+                    680.0,
+                    405.0,
+                    |this, ui, ctx| {
+                        let accent = this.config.accent();
+                        let t = this.start_time.elapsed().as_secs_f32();
+
+                        // Header card: installed version + GitHub repo
+                        egui::Frame::NONE
+                            .fill(Color32::from_rgba_unmultiplied(255, 255, 255, 12))
+                            .stroke(Stroke::new(
+                                1.0_f32,
+                                Color32::from_rgba_unmultiplied(255, 255, 255, 24),
+                            ))
+                            .corner_radius(CornerRadius::same(14))
+                            .inner_margin(egui::Margin::symmetric(14, 10))
+                            .show(ui, |ui| {
+                                ui.set_min_width(ui.available_width());
+                                ui.horizontal(|ui| {
+                                    let (ir, _) =
+                                        ui.allocate_exact_size(Vec2::splat(30.0), Sense::hover());
+                                    ui.painter().circle_filled(
+                                        ir.center(),
+                                        15.0,
+                                        Color32::from_rgba_unmultiplied(
+                                            accent.r(),
+                                            accent.g(),
+                                            accent.b(),
+                                            46,
+                                        ),
+                                    );
+                                    Self::draw_setting_icon(ui.painter(), ir.center(), 13, accent);
+                                    ui.add_space(6.0);
+                                    ui.vertical(|ui| {
+                                        ui.label(
+                                            RichText::new("Astryx Rust Launcher")
+                                                .font(FontId::proportional(15.0))
+                                                .strong()
+                                                .color(Color32::WHITE),
+                                        );
+                                        ui.label(
+                                            RichText::new(format!(
+                                                "Installed v{}  ·  github.com/{}",
+                                                current_ver,
+                                                updater::GITHUB_REPO
+                                            ))
+                                            .font(FontId::proportional(11.5))
+                                            .color(Color32::from_rgb(175, 192, 218)),
+                                        );
+                                    });
+                                });
+                            });
+
+                        ui.add_space(10.0);
+
+                        // Main status panel
+                        egui::Frame::NONE
+                            .fill(Color32::from_rgba_unmultiplied(10, 14, 24, 155))
+                            .stroke(Stroke::new(
+                                1.0_f32,
+                                Color32::from_rgba_unmultiplied(255, 255, 255, 22),
+                            ))
+                            .corner_radius(CornerRadius::same(14))
+                            .inner_margin(egui::Margin::symmetric(16, 12))
+                            .show(ui, |ui| {
+                                ui.set_min_width(ui.available_width());
+                                ui.set_min_height(130.0);
+
+                                match &state_snapshot {
+                                    UpdaterState::Idle | UpdaterState::Checking => {
+                                        ui.add_space(18.0);
+                                        ui.vertical_centered(|ui| {
+                                            let (sr, _) = ui.allocate_exact_size(
+                                                Vec2::splat(34.0),
+                                                Sense::hover(),
+                                            );
+                                            let p = ui.painter();
+                                            let c = sr.center();
+                                            p.circle_stroke(
+                                                c,
+                                                13.0,
+                                                Stroke::new(
+                                                    2.5_f32,
+                                                    Color32::from_rgba_unmultiplied(
+                                                        255, 255, 255, 28,
+                                                    ),
+                                                ),
+                                            );
+                                            let start_a = t * 5.2;
+                                            let mut arc = Vec::with_capacity(14);
+                                            for k in 0..=12 {
+                                                let a = start_a + (k as f32 / 12.0) * 2.4;
+                                                arc.push(c + Vec2::new(a.cos() * 13.0, a.sin() * 13.0));
+                                            }
+                                            p.add(egui::Shape::line(
+                                                arc,
+                                                Stroke::new(2.8_f32, accent),
+                                            ));
+                                            ui.add_space(10.0);
+                                            ui.label(
+                                                RichText::new("Checking GitHub Releases...")
+                                                    .font(FontId::proportional(14.5))
+                                                    .strong()
+                                                    .color(Color32::WHITE),
+                                            );
+                                        });
+                                    }
+
+                                    UpdaterState::UpToDate { latest } => {
+                                        let ok_c = Color32::from_rgb(52, 211, 153);
+                                        ui.add_space(12.0);
+                                        ui.vertical_centered(|ui| {
+                                            let (cr, _) = ui.allocate_exact_size(
+                                                Vec2::splat(36.0),
+                                                Sense::hover(),
+                                            );
+                                            let p = ui.painter();
+                                            let c = cr.center();
+                                            p.circle_filled(
+                                                c,
+                                                17.0,
+                                                Color32::from_rgba_unmultiplied(52, 211, 153, 40),
+                                            );
+                                            p.circle_stroke(c, 17.0, Stroke::new(1.8_f32, ok_c));
+                                            p.add(egui::Shape::line(
+                                                vec![
+                                                    c + Vec2::new(-6.5, 0.5),
+                                                    c + Vec2::new(-1.8, 5.0),
+                                                    c + Vec2::new(7.0, -4.8),
+                                                ],
+                                                Stroke::new(2.5_f32, ok_c),
+                                            ));
+                                            ui.add_space(8.0);
+                                            ui.label(
+                                                RichText::new("You're up to date!")
+                                                    .font(FontId::proportional(16.0))
+                                                    .strong()
+                                                    .color(Color32::WHITE),
+                                            );
+                                            ui.add_space(4.0);
+                                            let detail = if let Some(l) = latest {
+                                                format!(
+                                                    "Installed v{current_ver} matches latest release v{l}."
+                                                )
+                                            } else {
+                                                format!(
+                                                    "Running v{current_ver}. Publish a GitHub Release with an .apk to push OTA updates."
+                                                )
+                                            };
+                                            ui.label(
+                                                RichText::new(detail)
+                                                    .font(FontId::proportional(12.0))
+                                                    .color(Color32::from_rgb(185, 202, 226)),
+                                            );
+                                        });
+                                    }
+
+                                    UpdaterState::Available(rel) => {
+                                        ui.horizontal(|ui| {
+                                            egui::Frame::NONE
+                                                .fill(Color32::from_rgba_unmultiplied(
+                                                    accent.r(),
+                                                    accent.g(),
+                                                    accent.b(),
+                                                    65,
+                                                ))
+                                                .corner_radius(CornerRadius::same(8))
+                                                .inner_margin(egui::Margin::symmetric(10, 4))
+                                                .show(ui, |ui| {
+                                                    ui.label(
+                                                        RichText::new(format!(
+                                                            "NEW  v{} → v{}",
+                                                            current_ver, rel.version
+                                                        ))
+                                                        .font(FontId::proportional(12.0))
+                                                        .strong()
+                                                        .color(Color32::WHITE),
+                                                    );
+                                                });
+                                            ui.add_space(6.0);
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "{}  ·  {}",
+                                                    updater::format_mb(rel.apk_size),
+                                                    if rel.published_date.is_empty() {
+                                                        "Latest Release"
+                                                    } else {
+                                                        rel.published_date.as_str()
+                                                    }
+                                                ))
+                                                .font(FontId::proportional(12.0))
+                                                .color(Color32::from_rgb(180, 198, 224)),
+                                            );
+                                        });
+                                        ui.add_space(6.0);
+                                        ui.label(
+                                            RichText::new(&rel.title)
+                                                .font(FontId::proportional(14.5))
+                                                .strong()
+                                                .color(Color32::WHITE),
+                                        );
+                                        ui.add_space(4.0);
+                                        ScrollArea::vertical()
+                                            .id_salt("updater_notes")
+                                            .max_height(84.0)
+                                            .show(ui, |ui| {
+                                                ui.label(
+                                                    RichText::new(&rel.notes)
+                                                        .font(FontId::proportional(12.0))
+                                                        .color(Color32::from_rgb(205, 218, 238)),
+                                                );
+                                            });
+                                    }
+
+                                    UpdaterState::Downloading {
+                                        release,
+                                        downloaded,
+                                        total,
+                                    } => {
+                                        let ratio = if *total > 0 {
+                                            (*downloaded as f32 / *total as f32).clamp(0.0, 1.0)
+                                        } else {
+                                            0.0
+                                        };
+                                        let pct = (ratio * 100.0).round() as u32;
+                                        ui.add_space(16.0);
+                                        ui.label(
+                                            RichText::new(format!(
+                                                "Downloading v{} ({})...",
+                                                release.version, release.apk_name
+                                            ))
+                                            .font(FontId::proportional(14.0))
+                                            .strong()
+                                            .color(Color32::WHITE),
+                                        );
+                                        ui.add_space(10.0);
+                                        let (bar_r, _) = ui.allocate_exact_size(
+                                            Vec2::new(ui.available_width(), 14.0),
+                                            Sense::hover(),
+                                        );
+                                        let p = ui.painter();
+                                        p.rect_filled(
+                                            bar_r,
+                                            CornerRadius::same(7),
+                                            Color32::from_rgba_unmultiplied(255, 255, 255, 24),
+                                        );
+                                        let mut fill_r = bar_r;
+                                        fill_r.set_width((bar_r.width() * ratio).max(10.0));
+                                        p.rect_filled(fill_r, CornerRadius::same(7), accent);
+                                        ui.add_space(8.0);
+                                        ui.horizontal(|ui| {
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "{} / {}",
+                                                    updater::format_mb(*downloaded),
+                                                    updater::format_mb(*total)
+                                                ))
+                                                .font(FontId::proportional(12.5))
+                                                .color(Color32::from_rgb(190, 206, 230)),
+                                            );
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(Align::Center),
+                                                |ui| {
+                                                    ui.label(
+                                                        RichText::new(format!("{pct}%"))
+                                                            .font(FontId::proportional(13.5))
+                                                            .strong()
+                                                            .color(Color32::WHITE),
+                                                    );
+                                                },
+                                            );
+                                        });
+                                        ctx.request_repaint();
+                                    }
+
+                                    UpdaterState::ReadyToInstall { release, .. } => {
+                                        ui.add_space(16.0);
+                                        ui.vertical_centered(|ui| {
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "✓ v{} Downloaded & Verified",
+                                                    release.version
+                                                ))
+                                                .font(FontId::proportional(15.5))
+                                                .strong()
+                                                .color(Color32::from_rgb(52, 211, 153)),
+                                            );
+                                            ui.add_space(6.0);
+                                            ui.label(
+                                                RichText::new(
+                                                    "Confirm the Android TV system prompt to finish updating, or press 'Install Update' below.",
+                                                )
+                                                .font(FontId::proportional(12.0))
+                                                .color(Color32::from_rgb(200, 214, 236)),
+                                            );
+                                        });
+                                    }
+
+                                    UpdaterState::NeedPermission { release, .. } => {
+                                        ui.add_space(14.0);
+                                        ui.vertical_centered(|ui| {
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "Permission Needed to Install v{}",
+                                                    release.version
+                                                ))
+                                                .font(FontId::proportional(15.0))
+                                                .strong()
+                                                .color(Color32::from_rgb(251, 191, 36)),
+                                            );
+                                            ui.add_space(6.0);
+                                            ui.label(
+                                                RichText::new(
+                                                    "Enable 'Install unknown apps' for Astryx Rust Launcher in Android TV Settings, then press 'Install Update'.",
+                                                )
+                                                .font(FontId::proportional(12.0))
+                                                .color(Color32::from_rgb(210, 222, 240)),
+                                            );
+                                        });
+                                    }
+
+                                    UpdaterState::Error(err) => {
+                                        ui.add_space(16.0);
+                                        ui.vertical_centered(|ui| {
+                                            ui.label(
+                                                RichText::new("Update Notice")
+                                                    .font(FontId::proportional(15.0))
+                                                    .strong()
+                                                    .color(Color32::from_rgb(248, 113, 113)),
+                                            );
+                                            ui.add_space(6.0);
+                                            ui.label(
+                                                RichText::new(err)
+                                                    .font(FontId::proportional(12.0))
+                                                    .color(Color32::from_rgb(215, 225, 242)),
+                                            );
+                                        });
+                                    }
+                                }
+                            });
+
+                        ui.add_space(10.0);
+
+                        let primary_lbl = match &state_snapshot {
+                            UpdaterState::Available(_) => "Download & Install",
+                            UpdaterState::Downloading { .. } => "Downloading...",
+                            UpdaterState::ReadyToInstall { .. }
+                            | UpdaterState::NeedPermission { .. } => "Install Update",
+                            UpdaterState::Checking => "Checking...",
+                            _ => "Check for Updates",
+                        };
+                        let secondary_lbl = match &state_snapshot {
+                            UpdaterState::Available(_)
+                            | UpdaterState::ReadyToInstall { .. }
+                            | UpdaterState::NeedPermission { .. } => "Check Again",
+                            _ => "Close",
+                        };
+
+                        ui.horizontal(|ui| {
+                            if Self::modal_btn(
+                                ui,
+                                primary_lbl,
+                                true,
+                                this.modal_focus == 0,
+                                accent,
+                            ) {
+                                action = Some(0);
+                            }
+                            ui.add_space(8.0);
+                            if Self::modal_btn(
+                                ui,
+                                secondary_lbl,
+                                false,
+                                this.modal_focus == 1,
+                                accent,
+                            ) {
+                                action = Some(1);
+                            }
+                        });
+                    },
+                );
+
+                if let Some(a) = action {
+                    match a {
+                        0 => match self.updater_state.clone() {
+                            UpdaterState::Available(rel) => {
+                                self.spawn_download_update(ctx.clone(), rel);
+                            }
+                            UpdaterState::ReadyToInstall { release, apk_path }
+                            | UpdaterState::NeedPermission { release, apk_path } => {
+                                self.trigger_install_apk(release, apk_path);
+                            }
+                            UpdaterState::Checking | UpdaterState::Downloading { .. } => {}
+                            _ => {
+                                self.spawn_check_update(ctx.clone(), false);
+                            }
+                        },
+                        1 => match self.updater_state {
+                            UpdaterState::Available(_)
+                            | UpdaterState::ReadyToInstall { .. }
+                            | UpdaterState::NeedPermission { .. } => {
+                                self.spawn_check_update(ctx.clone(), false);
+                            }
+                            _ => {
+                                self.modal = ActiveModal::None;
+                            }
+                        },
+                        _ => {}
+                    }
+                }
+            }
         }
     }
     fn draw_zenith_home(&mut self, ctx: &egui::Context, visible: &[TvAppInfo]) {
@@ -4180,13 +4816,13 @@ impl AstryxTvApp {
         let dock_fill = self.config.dock_fill();
         let screen = ctx.screen_rect();
 
-        // 1. Unified Top-Bar Frosted Glass Capsule (Clock + Weather + 7 Quick Icons)
+        // 1. Top-Left Date & Time Capsule + Top-Right Weather & 7 Quick Icons Capsule
         if self.config.show_header {
             let time_str = self.cached_time_str.clone();
             let date_short = self.cached_date_short.clone();
 
-            egui::Area::new(egui::Id::new("zenith_top_bar"))
-                .anchor(Align2::CENTER_TOP, Vec2::new(0.0, 18.0))
+            egui::Area::new(egui::Id::new("zenith_clock_top_left"))
+                .anchor(Align2::LEFT_TOP, Vec2::new(28.0, 18.0))
                 .order(egui::Order::Middle)
                 .show(ctx, |ui| {
                     egui::Frame::NONE
@@ -4196,27 +4832,43 @@ impl AstryxTvApp {
                             Color32::from_rgba_unmultiplied(255, 255, 255, 48),
                         ))
                         .corner_radius(CornerRadius::same(26))
-                        .inner_margin(egui::Margin::symmetric(18, 8))
+                        .inner_margin(egui::Margin::symmetric(18, 9))
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = 12.0;
-
-                                // Clock + short date
+                                ui.spacing_mut().item_spacing.x = 10.0;
                                 ui.label(
                                     RichText::new(&time_str)
-                                        .font(FontId::proportional(20.0))
+                                        .font(FontId::proportional(21.0))
                                         .strong()
                                         .color(Color32::WHITE),
                                 );
                                 ui.label(
                                     RichText::new(&date_short)
-                                        .font(FontId::proportional(12.5))
-                                        .color(Color32::from_rgba_unmultiplied(215, 226, 244, 210)),
+                                        .font(FontId::proportional(13.0))
+                                        .color(Color32::from_rgba_unmultiplied(215, 226, 244, 215)),
                                 );
+                            });
+                        });
+                });
+
+            egui::Area::new(egui::Id::new("zenith_top_bar"))
+                .anchor(Align2::RIGHT_TOP, Vec2::new(-28.0, 18.0))
+                .order(egui::Order::Middle)
+                .show(ctx, |ui| {
+                    egui::Frame::NONE
+                        .fill(dock_fill)
+                        .stroke(Stroke::new(
+                            1.0_f32,
+                            Color32::from_rgba_unmultiplied(255, 255, 255, 48),
+                        ))
+                        .corner_radius(CornerRadius::same(26))
+                        .inner_margin(egui::Margin::symmetric(16, 8))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 12.0;
 
                                 // Interactive Weather chip
                                 if self.config.show_weather {
-                                    ui.separator();
                                     let w_focused = self.modal == ActiveModal::None
                                         && self.focus == FocusTarget::Weather;
                                     let w_txt = if let Some(w) = &self.weather {
@@ -4321,6 +4973,12 @@ impl AstryxTvApp {
                                             rect.right_bottom() + Vec2::new(-4.5, -4.5),
                                             3.0,
                                             Color32::from_rgb(56, 189, 248),
+                                        );
+                                    } else if idx == 6 && self.has_update_available() {
+                                        p.circle_filled(
+                                            rect.right_top() + Vec2::new(-4.0, 4.0),
+                                            3.6,
+                                            Color32::from_rgb(52, 211, 153),
                                         );
                                     }
                                     if resp.clicked() {

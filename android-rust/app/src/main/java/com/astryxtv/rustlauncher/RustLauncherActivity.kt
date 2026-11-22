@@ -2,11 +2,15 @@ package com.astryxtv.rustlauncher
 
 import android.app.ActivityManager
 import android.app.NativeActivity
+import android.app.PendingIntent
 import android.app.role.RoleManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ApplicationInfo
+import android.content.pm.PackageInstaller
 import android.content.pm.PackageManager
+import java.io.File
+import java.io.FileInputStream
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.drawable.BitmapDrawable
@@ -441,5 +445,68 @@ class RustLauncherActivity : NativeActivity() {
 
     fun rustSetPref(key: String, value: String) {
         prefs.edit().putString(key, value).apply()
+    }
+
+    fun rustGetAppVersion(): String {
+        return try {
+            packageManager.getPackageInfo(packageName, 0).versionName ?: "1.0.0"
+        } catch (_: Throwable) {
+            "1.0.0"
+        }
+    }
+
+    fun rustGetCacheDir(): String {
+        return cacheDir.absolutePath
+    }
+
+    fun rustInstallApk(apkPath: String): String {
+        return try {
+            val file = File(apkPath)
+            if (!file.exists() || file.length() < 100_000L) {
+                return "ERR:Downloaded APK file is missing or incomplete"
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !packageManager.canRequestPackageInstalls()) {
+                val permIntent = Intent(
+                    Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                    Uri.parse("package:$packageName")
+                ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                try {
+                    startActivity(permIntent)
+                } catch (_: Throwable) {
+                }
+                return "NEED_PERMISSION"
+            }
+
+            val installer = packageManager.packageInstaller
+            val params = PackageInstaller.SessionParams(PackageInstaller.SessionParams.MODE_FULL_INSTALL)
+            params.setSize(file.length())
+            val sessionId = installer.createSession(params)
+            val session = installer.openSession(sessionId)
+
+            session.openWrite("astryx_update", 0, file.length()).use { out ->
+                FileInputStream(file).use { input ->
+                    val buf = ByteArray(65_536)
+                    while (true) {
+                        val n = input.read(buf)
+                        if (n <= 0) break
+                        out.write(buf, 0, n)
+                    }
+                }
+                session.fsync(out)
+            }
+
+            val callbackIntent = Intent(this, UpdateInstallReceiver::class.java)
+            val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE
+            } else {
+                PendingIntent.FLAG_UPDATE_CURRENT
+            }
+            val pending = PendingIntent.getBroadcast(this, sessionId, callbackIntent, flags)
+            session.commit(pending.intentSender)
+            session.close()
+            "OK"
+        } catch (t: Throwable) {
+            "ERR:${t.message ?: t.javaClass.simpleName}"
+        }
     }
 }

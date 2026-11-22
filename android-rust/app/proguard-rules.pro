@@ -2,3 +2,6 @@
     public *;
     native <methods>;
 }
+-keep class com.astryxtv.rustlauncher.UpdateInstallReceiver {
+    *;
+}
