@@ -1,0 +1,1413 @@
+:root {
+  --tv-wallpaper: radial-gradient(ellipse 85% 65% at 15% 10%, rgba(168, 85, 247, 0.42), transparent 60%),
+    radial-gradient(ellipse 70% 55% at 88% 18%, rgba(56, 189, 248, 0.34), transparent 58%),
+    linear-gradient(155deg, #070812 0%, #0d1024 48%, #090616 100%);
+  --tv-accent: #a855f7;
+  --tv-accent-2: #38bdf8;
+  --tv-glass-blur: 10px;
+  --tv-glass-bg: rgba(255, 255, 255, 0.12);
+  --tv-glass-bg-strong: rgba(14, 16, 28, 0.92);
+  --tv-shadow: 0 8px 20px rgba(0, 0, 0, 0.48);
+  --tv-tile-radius: 14px;
+  --tv-icon-size: 72px;
+  --tv-icon-slot: 92px;
+  --tv-heading-weight: 900;
+  --tv-body-weight: 700;
+  --tv-ease: cubic-bezier(0.2, 0, 0, 1);
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: #06070c;
+  color: #f8fafc;
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+}
+
+.tv-viewport {
+  position: relative;
+  width: 100vw;
+  height: 100vh;
+  overflow: hidden;
+  background: var(--tv-wallpaper);
+}
+
+/* Photorealistic Realtime Weather Wallpaper */
+.tv-weather-bg {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.tv-weather-photo {
+  position: absolute;
+  inset: 0;
+  background-size: cover;
+  background-position: center;
+  background-repeat: no-repeat;
+  animation: tv-fade-in 380ms ease-out both;
+}
+
+@keyframes tv-fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+.tv-weather-mist {
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(ellipse 70% 45% at 25% 35%, rgba(226, 232, 240, 0.16), transparent 65%),
+    radial-gradient(ellipse 65% 45% at 75% 65%, rgba(203, 213, 225, 0.14), transparent 65%);
+}
+
+.tv-weather-sunbeam {
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(circle at 80% 10%, rgba(254, 240, 138, 0.2), rgba(251, 146, 60, 0.07) 38%, transparent 64%);
+}
+
+.tv-weather-canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+
+.tv-weather-scrim {
+  position: absolute;
+  inset: 0;
+}
+
+@keyframes tv-weather-kenburns {
+  0% {
+    transform: translate3d(-1.5%, -1%, 0) scale(1.02);
+  }
+  100% {
+    transform: translate3d(1.5%, 1%, 0) scale(1.09);
+  }
+}
+
+.tv-ambient-layer {
+  position: fixed;
+  inset: -12%;
+  pointer-events: none;
+  background: radial-gradient(
+      circle at 18% 12%,
+      rgba(168, 85, 247, 0.24),
+      transparent 42%
+    ),
+    radial-gradient(
+      circle at 82% 84%,
+      rgba(56, 189, 248, 0.2),
+      transparent 44%
+    );
+  will-change: transform;
+  animation: tv-ambient-drift 22s ease-in-out infinite alternate;
+}
+
+@keyframes tv-ambient-drift {
+  0% {
+    transform: translate3d(-2%, -1.5%, 0) scale(1);
+  }
+  100% {
+    transform: translate3d(2.5%, 2%, 0) scale(1.06);
+  }
+}
+
+@keyframes tv-fade-up {
+  from {
+    opacity: 0;
+    transform: translate3d(0, 10px, 0);
+  }
+  to {
+    opacity: 1;
+    transform: translate3d(0, 0, 0);
+  }
+}
+
+@keyframes tv-modal-in {
+  from {
+    opacity: 0;
+    transform: translate3d(0, 10px, 0) scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+}
+
+@keyframes tv-toast-in {
+  from {
+    opacity: 0;
+    transform: translate3d(-50%, 14px, 0) scale(0.95);
+  }
+  to {
+    opacity: 1;
+    transform: translate3d(-50%, 0, 0) scale(1);
+  }
+}
+
+.tv-scroll-root {
+  position: relative;
+  z-index: 1;
+  width: 100%;
+  height: 100%;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 20px 32px 40px;
+  scroll-padding-top: 24px;
+  scroll-padding-bottom: 28px;
+  box-sizing: border-box;
+  overscroll-behavior: contain;
+}
+
+.tv-scroll-root::-webkit-scrollbar {
+  display: none;
+}
+
+.tv-surface-wrapper {
+  margin-bottom: 16px;
+}
+
+.tv-layout {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+/* Subtle frosted glass surfaces (controlled by --tv-glass-blur) */
+.glass-panel {
+  background: rgba(14, 18, 30, 0.42);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  box-shadow: var(--tv-shadow);
+}
+
+/* Frosted modal surface — blur lives on static .tv-modal-backdrop::before so moving focus inside menus never re-blurs */
+.glass-panel-strong {
+  background: var(--tv-menu-bg, rgba(14, 18, 30, 0.68));
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  box-shadow: 0 20px 48px rgba(0, 0, 0, 0.72);
+}
+
+.glass-btn {
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  color: #f8fafc;
+}
+
+.glass-btn:active,
+.tv-pill-interactive:active {
+  transform: scale(0.95) translateZ(0) !important;
+}
+
+/* Instant, lightweight TV focus ring (avoid 40+ permanent will-change GPU layers) */
+[data-tv-focusable='true'] {
+  outline: none;
+}
+
+[data-tv-focusable='true']:focus-visible,
+[data-tv-focusable='true']:focus {
+  outline: 2.5px solid var(--tv-accent);
+  outline-offset: 2px;
+  border-color: #ffffff !important;
+  transform: scale(1.035) translateZ(0);
+  z-index: 5;
+}
+
+/* Minimal Floating Icon-Only Top Bar with tight liquid-glass capsule */
+.tv-status-bar {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  padding: 2px 0;
+  contain: layout style;
+}
+
+.tv-status-dock {
+  padding: 6px 8px;
+  border-radius: 999px;
+  background: var(--tv-dock-bg, rgba(14, 18, 30, 0.52));
+  backdrop-filter: blur(var(--tv-glass-blur));
+  -webkit-backdrop-filter: blur(var(--tv-glass-blur));
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  contain: layout style paint;
+}
+
+.tv-brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.tv-brand-mark {
+  width: 30px;
+  height: 30px;
+  border-radius: 9px;
+  display: grid;
+  place-items: center;
+  background: linear-gradient(135deg, var(--tv-accent), var(--tv-accent-2));
+  color: #fff;
+}
+
+.tv-brand-mark svg {
+  width: 16px;
+  height: 16px;
+}
+
+.tv-brand-title {
+  margin: 0 !important;
+  font-size: 15px !important;
+  line-height: 1.1 !important;
+  font-weight: var(--tv-heading-weight) !important;
+  letter-spacing: -0.02em;
+  color: #ffffff !important;
+}
+
+.tv-brand-sub {
+  font-size: 10.5px !important;
+  line-height: 1.15 !important;
+  font-weight: 700 !important;
+  color: rgba(255, 255, 255, 0.82) !important;
+  text-shadow: 0 1px 4px rgba(0, 0, 0, 0.45);
+}
+
+.tv-status-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.tv-status-pills {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.tv-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 9px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.tv-pill svg {
+  width: 12px;
+  height: 12px;
+}
+
+.tv-pill-ok {
+  background: rgba(16, 185, 129, 0.22);
+  border: 1px solid rgba(52, 211, 153, 0.42);
+  color: #6ee7b7;
+}
+
+.tv-pill-warn {
+  background: rgba(239, 68, 68, 0.24);
+  border: 1px solid rgba(248, 113, 113, 0.45);
+  color: #fca5a5;
+}
+
+.tv-pill-interactive {
+  cursor: pointer;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.3);
+  transition: transform 130ms cubic-bezier(0.22, 1, 0.36, 1), border-color 130ms ease;
+}
+
+.tv-pill-vpn {
+  background: linear-gradient(135deg, rgba(56, 189, 248, 0.32), rgba(14, 165, 233, 0.14));
+  border: 1px solid rgba(125, 211, 252, 0.55);
+  color: #bae6fd;
+}
+
+.tv-pill-vpn-off {
+  background: linear-gradient(135deg, rgba(255, 255, 255, 0.16), rgba(255, 255, 255, 0.06));
+  border: 1px solid rgba(255, 255, 255, 0.24);
+  color: rgba(241, 245, 249, 0.78);
+}
+
+.tv-pill-weather {
+  background: rgba(255, 255, 255, 0.11);
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  color: #f1f5f9;
+}
+
+.tv-telemetry-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.tv-reorder-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.tv-quick-btns {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.tv-top-icon-btn {
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  border-radius: 999px;
+  display: grid;
+  place-items: center;
+  cursor: pointer;
+}
+
+.tv-top-icon-btn svg {
+  width: 16px;
+  height: 16px;
+}
+
+.tv-icon-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 6px 10px;
+  border-radius: 10px;
+  font-size: 11.5px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.tv-icon-btn svg {
+  width: 14px;
+  height: 14px;
+}
+
+.tv-icon-btn:hover {
+  background: rgba(255, 255, 255, 0.18);
+}
+
+.tv-clock-block {
+  text-align: right;
+  padding-left: 10px;
+  border-left: 1px solid rgba(255, 255, 255, 0.16);
+}
+
+.tv-clock-time {
+  font-size: 18px;
+  font-weight: var(--tv-heading-weight);
+  line-height: 1;
+  letter-spacing: -0.02em;
+  color: #ffffff;
+}
+
+.tv-clock-date {
+  font-size: 10px;
+  font-weight: 700;
+  opacity: 0.72;
+  margin-top: 2px;
+}
+
+/* Borderless Realtime Clock, Date & Detailed Weather Band */
+.tv-cw-band {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 24px;
+  padding: 6px 6px 4px;
+  contain: layout style;
+  animation: tv-fade-up 240ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+.tv-cw-clock-col {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.tv-cw-time-row {
+  display: flex;
+  align-items: baseline;
+  gap: 2px;
+  font-variant-numeric: tabular-nums;
+  line-height: 0.95;
+  text-shadow: 0 4px 18px rgba(0, 0, 0, 0.55);
+}
+
+.tv-cw-time-main {
+  font-size: 46px;
+  font-weight: var(--tv-heading-weight);
+  letter-spacing: -0.03em;
+  color: #ffffff;
+}
+
+.tv-cw-time-sec {
+  font-size: 22px;
+  font-weight: 800;
+  color: var(--tv-accent-2);
+  opacity: 0.92;
+}
+
+.tv-cw-time-period {
+  font-size: 16px;
+  font-weight: 800;
+  margin-left: 6px;
+  color: rgba(255, 255, 255, 0.78);
+}
+
+.tv-cw-date-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13.5px;
+  font-weight: 700;
+  color: rgba(241, 245, 249, 0.88);
+  text-shadow: 0 2px 10px rgba(0, 0, 0, 0.5);
+}
+
+.tv-cw-dot {
+  color: var(--tv-accent-2);
+}
+
+.tv-cw-loc {
+  color: rgba(226, 232, 240, 0.72);
+  font-weight: 700;
+}
+
+.tv-cw-weather-col {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+}
+
+.tv-cw-weather-btn {
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 16px;
+  padding: 6px 10px;
+  cursor: pointer;
+  color: inherit;
+  transition: transform 100ms ease-out, background-color 100ms ease-out, border-color 100ms ease-out;
+}
+
+.tv-cw-weather-btn:focus,
+.tv-cw-weather-btn:focus-visible {
+  background: rgba(255, 255, 255, 0.12);
+}
+
+/* Weather Forecast Modal */
+.tv-weather-modal {
+  width: min(850px, 94vw);
+  max-height: 92vh;
+  padding: 16px 20px 18px;
+  gap: 10px;
+}
+
+.tv-weather-body {
+  gap: 11px;
+  padding-bottom: 4px;
+}
+
+.tv-weather-hero-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 10px 14px;
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+}
+
+.tv-weather-hero-main {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-shrink: 0;
+}
+
+.tv-weather-hero-temp {
+  font-size: 28px;
+  font-weight: var(--tv-heading-weight);
+  line-height: 1;
+}
+
+.tv-weather-hero-cond {
+  font-size: 12.5px;
+  font-weight: 700;
+  opacity: 0.86;
+  margin-top: 4px;
+}
+
+.tv-hourly-grid {
+  display: grid;
+  grid-template-columns: repeat(8, 1fr);
+  gap: 7px;
+}
+
+.tv-hourly-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 8px 4px;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.13);
+}
+
+.tv-hourly-time {
+  font-size: 10px;
+  font-weight: 700;
+  opacity: 0.72;
+}
+
+.tv-hourly-temp {
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.tv-hourly-rain {
+  font-size: 10px;
+  font-weight: 700;
+  color: #7dd3fc;
+}
+
+.tv-daily-grid {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 8px;
+}
+
+.tv-daily-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 5px;
+  padding: 10px 8px;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.13);
+  text-align: center;
+}
+
+.tv-daily-day {
+  font-size: 11.5px;
+  font-weight: 800;
+  color: #ffffff;
+}
+
+.tv-daily-cond-text {
+  font-size: 10.5px;
+  font-weight: 600;
+  opacity: 0.78;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+}
+
+.tv-daily-bottom {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  margin-top: 2px;
+  padding-top: 5px;
+  border-top: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.tv-daily-rain {
+  font-size: 10.5px;
+  font-weight: 700;
+  color: #7dd3fc;
+}
+
+.tv-daily-temps {
+  font-size: 11.5px;
+  color: rgba(255, 255, 255, 0.78);
+}
+
+.tv-daily-temps strong {
+  color: #ffffff;
+}
+
+.tv-cw-weather-top {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  text-shadow: 0 3px 14px rgba(0, 0, 0, 0.5);
+}
+
+.tv-cw-weather-icon {
+  color: var(--tv-accent-2);
+  display: grid;
+  place-items: center;
+}
+
+.tv-cw-weather-primary {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+
+.tv-cw-temp {
+  font-size: 32px;
+  font-weight: var(--tv-heading-weight);
+  letter-spacing: -0.03em;
+  line-height: 1;
+  color: #ffffff;
+}
+
+.tv-cw-cond {
+  font-size: 14px;
+  font-weight: 800;
+  color: rgba(241, 245, 249, 0.9);
+}
+
+.tv-cw-metrics {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.tv-cw-metric {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: rgba(14, 18, 30, 0.42);
+  backdrop-filter: blur(var(--tv-glass-blur));
+  -webkit-backdrop-filter: blur(var(--tv-glass-blur));
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  font-size: 11px;
+  font-weight: 700;
+  color: #f8fafc;
+}
+
+/* Sleek Compact Hero Banner */
+.tv-hero {
+  position: relative;
+  overflow: hidden;
+  border-radius: 18px;
+  padding: 16px 22px;
+  contain: layout style paint;
+}
+
+.tv-hero-glow {
+  position: absolute;
+  inset: -60% -5% auto auto;
+  width: 320px;
+  height: 320px;
+  border-radius: 50%;
+  background: radial-gradient(
+    circle,
+    rgba(168, 85, 247, 0.34),
+    rgba(56, 189, 248, 0.12) 48%,
+    transparent 70%
+  );
+  pointer-events: none;
+}
+
+.tv-hero-content {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.tv-hero-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.tv-hero-eyebrow {
+  font-size: 10.5px;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--tv-accent-2);
+}
+
+.tv-hero-title {
+  margin: 0 !important;
+  font-size: 23px !important;
+  line-height: 1.12 !important;
+  font-weight: var(--tv-heading-weight) !important;
+  letter-spacing: -0.025em;
+  color: #ffffff !important;
+}
+
+.tv-hero-subtitle {
+  margin: 0 !important;
+  font-size: 12px !important;
+  line-height: 1.35 !important;
+  font-weight: 600 !important;
+  color: rgba(241, 245, 249, 0.78) !important;
+  max-width: 580px;
+}
+
+.tv-hero-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 4px;
+}
+
+.tv-astryx-btn {
+  border-radius: 10px !important;
+  font-size: 12px !important;
+  font-weight: 800 !important;
+  padding: 6px 14px !important;
+  min-height: 32px !important;
+  transition: transform 95ms var(--tv-ease) !important;
+}
+
+.tv-astryx-btn-primary {
+  background: linear-gradient(135deg, var(--tv-accent), var(--tv-accent-2)) !important;
+  color: #ffffff !important;
+  border: 1px solid rgba(255, 255, 255, 0.28) !important;
+}
+
+.tv-astryx-btn-secondary {
+  background: rgba(255, 255, 255, 0.12) !important;
+  color: #ffffff !important;
+  border: 1px solid rgba(255, 255, 255, 0.2) !important;
+}
+
+/* Shelves */
+.tv-shelf {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  contain: layout style;
+  animation: tv-fade-up 260ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+.tv-shelf-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-left: 2px;
+}
+
+.tv-shelf-title {
+  margin: 0 !important;
+  font-size: 14.5px !important;
+  line-height: 1.2 !important;
+  font-weight: var(--tv-heading-weight) !important;
+  letter-spacing: -0.015em;
+  color: #ffffff !important;
+}
+
+.tv-shelf-track {
+  display: flex;
+  align-items: stretch;
+  gap: 12px;
+  overflow-x: auto;
+  padding: 6px 6px 10px;
+  overscroll-behavior-x: contain;
+}
+
+.tv-shelf-track::-webkit-scrollbar {
+  display: none;
+}
+
+.tv-shelf-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  padding: 6px 4px 12px;
+}
+
+/* Circular Android TV App Icons */
+.tv-app-tile {
+  flex: 0 0 var(--tv-icon-slot);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 7px;
+  padding: 4px 2px;
+  border-radius: 16px;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  text-align: center;
+  color: #ffffff;
+  contain: layout style;
+  transition: transform 90ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+.tv-app-tile:focus-visible,
+.tv-app-tile:focus {
+  outline: none !important;
+  border-color: transparent !important;
+  transform: scale(1.1) translateZ(0);
+}
+
+.tv-app-tile:active {
+  transform: scale(0.96) translateZ(0);
+}
+
+.tv-app-circle {
+  position: relative;
+  width: var(--tv-icon-size);
+  height: var(--tv-icon-size);
+  border-radius: 999px;
+  overflow: hidden;
+  background: rgba(14, 18, 30, 0.55);
+  border: 1.5px solid rgba(255, 255, 255, 0.16);
+  box-shadow: var(--tv-shadow);
+  display: grid;
+  place-items: center;
+}
+
+.tv-app-tile:focus .tv-app-circle,
+.tv-app-tile:focus-visible .tv-app-circle {
+  border-color: #ffffff;
+  outline: 3px solid var(--tv-accent);
+  outline-offset: 1px;
+}
+
+.tv-app-circle-img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: 999px;
+  display: block;
+}
+
+.tv-app-circle-sheen {
+  display: none;
+}
+
+.tv-app-pin {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 18px;
+  height: 18px;
+  border-radius: 999px;
+  background: rgba(10, 12, 24, 0.85);
+  border: 1px solid rgba(255, 255, 255, 0.3);
+  color: var(--tv-accent-2);
+  display: grid;
+  place-items: center;
+}
+
+.tv-app-pin svg {
+  width: 10px;
+  height: 10px;
+}
+
+.tv-app-tile-label {
+  width: 88px;
+  font-size: 11px;
+  line-height: 1.2;
+  font-weight: var(--tv-body-weight);
+  color: rgba(255, 255, 255, 0.86);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tv-app-tile:focus .tv-app-tile-label {
+  color: #ffffff;
+}
+
+/* Compact Dynamic A2UI Widget Cards */
+.tv-widget-card {
+  flex: 0 0 182px;
+  border-radius: var(--tv-tile-radius);
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  text-align: left;
+  color: #ffffff;
+  position: relative;
+  overflow: hidden;
+  contain: layout style paint;
+  transition: transform 95ms var(--tv-ease), border-color 95ms var(--tv-ease);
+}
+
+.tv-widget-interactive {
+  cursor: pointer;
+}
+
+.tv-widget-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 2px;
+}
+
+.tv-widget-icon {
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  display: grid;
+  place-items: center;
+  background: rgba(255, 255, 255, 0.12);
+  color: var(--widget-accent, var(--tv-accent-2));
+  border: 1px solid rgba(255, 255, 255, 0.18);
+}
+
+.tv-widget-icon svg {
+  width: 15px;
+  height: 15px;
+}
+
+.tv-widget-title {
+  font-size: 10px;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  opacity: 0.72;
+}
+
+.tv-widget-value {
+  font-size: 16px;
+  font-weight: var(--tv-heading-weight);
+  letter-spacing: -0.02em;
+}
+
+.tv-widget-sub {
+  font-size: 10.5px;
+  line-height: 1.25;
+  font-weight: 600;
+  opacity: 0.7;
+}
+
+/* Standard A2UI primitives */
+.a2ui-row {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.a2ui-column {
+  display: flex;
+  flex-direction: column;
+}
+
+.a2ui-astryx-card {
+  border-radius: var(--tv-tile-radius) !important;
+  padding: 14px !important;
+}
+
+/* Modals — static blurred backdrop pseudo-element isolated from interactive modal layer for instant 60fps menu navigation */
+.tv-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: grid;
+  place-items: center;
+  padding: 16px;
+  isolation: isolate;
+}
+
+.tv-modal-backdrop::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  background: rgba(4, 6, 14, 0.56);
+  backdrop-filter: blur(var(--tv-glass-blur));
+  -webkit-backdrop-filter: blur(var(--tv-glass-blur));
+  pointer-events: none;
+}
+
+.tv-modal {
+  position: relative;
+  z-index: 1;
+  width: min(740px, 92vw);
+  max-height: 88vh;
+  border-radius: 18px;
+  padding: 18px 22px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  overflow: hidden;
+  contain: layout style paint;
+  transform: translateZ(0);
+}
+
+/* Inside modals, skip scale transforms for instant 1-frame focus response */
+[data-tv-modal='true'] [data-tv-focusable='true']:focus,
+[data-tv-modal='true'] [data-tv-focusable='true']:focus-visible {
+  transform: none;
+  background-color: rgba(255, 255, 255, 0.16);
+}
+
+.tv-modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.tv-modal-title-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.tv-modal-title-row h2 {
+  font-size: 18px !important;
+  margin: 0 !important;
+}
+
+.tv-modal-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 2px 6px 14px 2px;
+}
+
+.tv-modal-footer {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  padding-top: 4px;
+}
+
+.tv-custom-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.tv-section-label {
+  font-size: 11px !important;
+  font-weight: 800 !important;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  opacity: 0.75;
+}
+
+.tv-choice-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 8px;
+}
+
+.tv-choice-card {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.07);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  color: #ffffff;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+  transition: transform 95ms var(--tv-ease), border-color 95ms var(--tv-ease);
+}
+
+.tv-choice-card span {
+  font-size: 10px;
+  opacity: 0.72;
+}
+
+.tv-choice-card.is-active,
+.tv-wallpaper-btn.is-active,
+.tv-accent-pill.is-active,
+.tv-step-btn.is-active {
+  border-color: var(--tv-accent);
+  background: rgba(168, 85, 247, 0.28);
+}
+
+.tv-swatch-row {
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  gap: 8px;
+}
+
+.tv-wallpaper-btn {
+  height: 48px;
+  border-radius: 12px;
+  border: 2px solid rgba(255, 255, 255, 0.18);
+  color: #ffffff;
+  font-size: 11px;
+  font-weight: 800;
+  display: flex;
+  align-items: flex-end;
+  padding: 6px 8px;
+  cursor: pointer;
+  text-shadow: 0 2px 6px rgba(0, 0, 0, 0.85);
+}
+
+.tv-accent-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.tv-accent-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 11px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.tv-accent-dot {
+  width: 12px;
+  height: 12px;
+  border-radius: 999px;
+}
+
+.tv-sliders-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 10px;
+}
+
+.tv-control-box {
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.tv-control-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 11.5px;
+  font-weight: 700;
+}
+
+.tv-step-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.tv-step-btn {
+  padding: 5px 9px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: capitalize;
+  cursor: pointer;
+}
+
+.tv-toggles-box {
+  justify-content: center;
+  gap: 7px;
+}
+
+.tv-toggle-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  width: 100%;
+  padding: 7px 10px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  color: #f8fafc;
+  font-size: 11.5px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: transform 110ms var(--tv-ease), background-color 110ms ease;
+}
+
+.tv-toggle-row.is-on .tv-toggle-pill {
+  background: linear-gradient(135deg, var(--tv-accent), var(--tv-accent-2));
+  color: #ffffff;
+  border-color: rgba(255, 255, 255, 0.35);
+}
+
+.tv-toggle-pill {
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  background: rgba(255, 255, 255, 0.12);
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  color: rgba(255, 255, 255, 0.72);
+}
+
+/* A2UI Studio */
+.tv-surface-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.tv-endpoint-row {
+  display: flex;
+  gap: 8px;
+}
+
+.tv-text-input {
+  flex: 1;
+  padding: 8px 12px;
+  border-radius: 10px;
+  background: rgba(0, 0, 0, 0.4);
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  color: #ffffff;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.tv-json-editor {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 10px;
+  border-radius: 10px;
+  background: rgba(0, 0, 0, 0.45);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  color: #e2e8f0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  line-height: 1.4;
+  resize: vertical;
+}
+
+.tv-hint {
+  font-size: 10.5px;
+  opacity: 0.65;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.tv-feedback {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 12px;
+  border-radius: 10px;
+  font-size: 11.5px;
+  font-weight: 700;
+}
+
+.tv-feedback-ok {
+  background: rgba(16, 185, 129, 0.18);
+  border: 1px solid rgba(52, 211, 153, 0.4);
+  color: #6ee7b7;
+}
+
+.tv-feedback-err {
+  background: rgba(239, 68, 68, 0.2);
+  border: 1px solid rgba(248, 113, 113, 0.45);
+  color: #fca5a5;
+}
+
+/* App Context Menu */
+.tv-context-sheet {
+  position: relative;
+  z-index: 1;
+  width: min(360px, 88vw);
+  border-radius: 18px;
+  padding: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  contain: layout style paint;
+  transform: translateZ(0);
+}
+
+.tv-context-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.tv-context-thumb {
+  width: 52px;
+  height: 52px;
+  object-fit: cover;
+  border-radius: 999px;
+  border: 2px solid rgba(255, 255, 255, 0.28);
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.tv-context-badges {
+  display: flex;
+  gap: 5px;
+  margin-top: 4px;
+}
+
+.tv-context-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.tv-context-btn {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  color: #ffffff;
+  font-size: 12.5px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: transform 95ms var(--tv-ease);
+}
+
+.tv-context-danger {
+  color: #fca5a5;
+  border-color: rgba(248, 113, 113, 0.3);
+}
+
+/* Toast */
+.tv-toast {
+  position: fixed;
+  left: 50%;
+  bottom: 20px;
+  transform: translateX(-50%);
+  z-index: 80;
+  padding: 8px 18px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 800;
+  color: #ffffff;
+  animation: tv-toast-in 160ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}

@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="320dp"
+    android:height="180dp"
+    android:viewportWidth="320"
+    android:viewportHeight="180">
+    <path android:pathData="M0,0h320v180h-320z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:endX="320"
+                android:endY="180"
+                android:startX="0"
+                android:startY="0"
+                android:type="linear">
+                <item android:color="#0C1022" android:offset="0" />
+                <item android:color="#1E1B4B" android:offset="0.5" />
+                <item android:color="#311042" android:offset="1" />
+            </gradient>
+        </aapt:attr>
+    </path>
+    <!-- Glowing star / astryx mark -->
+    <path
+        android:fillColor="#A78BFA"
+        android:pathData="M160,36 L170,78 L212,88 L170,98 L160,140 L150,98 L108,88 L150,78 Z" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M160,54 L166,82 L194,88 L166,94 L160,122 L154,94 L126,88 L154,82 Z" />
+</vector>

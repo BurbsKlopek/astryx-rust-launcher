@@ -1,0 +1,33 @@
+{
+  "name": "astryx-tv-launcher-web",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "build:android": "vite build --outDir ../android/app/src/main/assets/www --emptyOutDir",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@a2ui/react": "latest",
+    "@a2ui/web_core": "latest",
+    "@astryxdesign/core": "latest",
+    "@astryxdesign/theme-gothic": "latest",
+    "@astryxdesign/theme-matcha": "latest",
+    "@astryxdesign/theme-neutral": "latest",
+    "@astryxdesign/theme-y2k": "latest",
+    "@stylexjs/stylex": "latest",
+    "lucide-react": "^0.511.0",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@types/react": "^19.1.0",
+    "@types/react-dom": "^19.1.0",
+    "@vitejs/plugin-react": "^4.5.0",
+    "typescript": "^5.8.0",
+    "vite": "^6.3.0"
+  }
+}
