@@ -11,7 +11,7 @@ android/.gradle/
 android/local.properties
 web/node_modules/
 web/dist/
-vendor/
+/vendor/
 
 # OS / IDE
 .DS_Store
