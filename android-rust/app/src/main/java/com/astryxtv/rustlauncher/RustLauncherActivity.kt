@@ -368,6 +368,18 @@ class RustLauncherActivity : NativeActivity() {
         }
     }
 
+    fun rustOpenUrl(url: String): Boolean {
+        return try {
+            val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url)).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            startActivity(intent)
+            true
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
     fun rustUninstallApp(pkg: String) {
         try {
             val intent = Intent(Intent.ACTION_DELETE).apply {

@@ -192,6 +192,22 @@ pub fn open_app_info(pkg: &str) {
     });
 }
 
+pub fn open_url(url: &str) -> bool {
+    with_activity(|env, act| {
+        let jurl = env.new_string(url).ok()?;
+        env.call_method(
+            act,
+            "rustOpenUrl",
+            "(Ljava/lang/String;)Z",
+            &[JValue::Object(&jurl)],
+        )
+        .ok()?
+        .z()
+        .ok()
+    })
+    .unwrap_or(false)
+}
+
 pub fn uninstall_app(pkg: &str) {
     let _ = with_activity(|env, act| {
         let jpkg = env.new_string(pkg).ok()?;

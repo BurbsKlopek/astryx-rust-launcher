@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const PREF_CONFIG_KEY: &str = "astryx_rust_config_v1";
+const DONATE_URL: &str = "https://buymeacoffee.com/BurbsKlopek";
 
 enum BgMsg {
     AppsLoaded(Vec<TvAppInfo>),
@@ -70,6 +71,7 @@ enum ActiveModal {
     Settings,
     Updater,
     Overlay,
+    Donate,
     Search,
     A2ui,
     AppContext(String), // package_name
@@ -1676,6 +1678,26 @@ impl AstryxTvApp {
                 p.add(egui::Shape::line(pts, s));
                 p.line_segment([c + Vec2::new(0.0, 1.2), c + Vec2::new(3.6, -2.8)], Stroke::new(1.7_f32, color));
                 p.circle_filled(c + Vec2::new(0.0, 1.2), 1.4, color);
+            }
+            // Buy Me a Coffee: coffee cup + handle + saucer
+            15 => {
+                p.rect_stroke(
+                    Rect::from_center_size(c + Vec2::new(-1.0, 0.2), Vec2::new(7.4, 6.8)),
+                    CornerRadius::same(2),
+                    s,
+                    egui::StrokeKind::Middle,
+                );
+                // Cup handle
+                p.rect_stroke(
+                    Rect::from_center_size(c + Vec2::new(4.0, 0.0), Vec2::new(2.8, 3.8)),
+                    CornerRadius::same(2),
+                    s,
+                    egui::StrokeKind::Middle,
+                );
+                // Saucer + steam
+                p.line_segment([c + Vec2::new(-5.2, 5.0), c + Vec2::new(4.2, 5.0)], s);
+                p.line_segment([c + Vec2::new(-2.2, -4.4), c + Vec2::new(-2.2, -5.8)], Stroke::new(1.3_f32, color));
+                p.line_segment([c + Vec2::new(0.6, -4.4), c + Vec2::new(0.6, -5.8)], Stroke::new(1.3_f32, color));
             }
             // Device / Display: TV monitor
             100 | 202 => {
@@ -3458,9 +3480,9 @@ impl AstryxTvApp {
             }
 
             ActiveModal::Settings => {
-                // 16 settings (0..16, 4 categories) + row 16 = Android TV Shortcuts (4 columns)
-                const SETTING_COUNT: usize = 16;
-                const SYS_IDX: usize = 16;
+                // 17 settings (0..17, 4 categories) + row 17 = Android TV Shortcuts (4 columns)
+                const SETTING_COUNT: usize = 17;
+                const SYS_IDX: usize = 17;
                 const GRID_COLS: usize = 3;
                 let is_grid = self.config.settings_view == SettingsViewMode::Grid;
 
@@ -3626,6 +3648,9 @@ impl AstryxTvApp {
                     }
                     15 => {
                         this.open_modal(ActiveModal::Overlay);
+                    }
+                    16 => {
+                        this.open_modal(ActiveModal::Donate);
                     }
                     _ => {}
                 };
@@ -3859,9 +3884,15 @@ impl AstryxTvApp {
                                 this.config.show_fps_meter,
                                 14,
                             ),
+                            (
+                                "Buy Me a Coffee",
+                                "Support".to_string(),
+                                false,
+                                15,
+                            ),
                         ];
 
-                        let is_submenu_item = |idx: usize| matches!(idx, 13 | 14 | 15);
+                        let is_submenu_item = |idx: usize| matches!(idx, 13 | 14 | 15 | 16);
 
                         let category_for = |idx: usize| -> Option<&'static str> {
                             match idx {
@@ -5349,6 +5380,165 @@ impl AstryxTvApp {
                         }
                     },
                 );
+            }
+
+            ActiveModal::Donate => {
+                let mut action: Option<u8> = None;
+                if allow_keys {
+                    ctx.input(|i| {
+                        if i.key_pressed(Key::ArrowLeft) {
+                            self.modal_focus = self.modal_focus.saturating_sub(1);
+                        } else if i.key_pressed(Key::ArrowRight) {
+                            self.modal_focus = (self.modal_focus + 1).min(1);
+                        } else if i.key_pressed(Key::ArrowUp) {
+                            self.modal_close_focused = true;
+                        } else if i.key_pressed(Key::Enter) || i.key_pressed(Key::Space) {
+                            action = Some(self.modal_focus as u8);
+                        }
+                    });
+                }
+
+                let coffee_gold = Color32::from_rgb(255, 221, 0);
+
+                self.draw_modal_shell(
+                    ctx,
+                    "Buy Me a Coffee  ·  Support Astryx",
+                    640.0,
+                    365.0,
+                    |this, ui, _ctx| {
+                        let accent = this.config.accent();
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 22.0;
+
+                            // Left: Crisp 4K vector QR code card (instant phone scan!)
+                            egui::Frame::NONE
+                                .fill(Color32::WHITE)
+                                .stroke(Stroke::new(2.0_f32, coffee_gold))
+                                .corner_radius(CornerRadius::same(16))
+                                .inner_margin(egui::Margin::same(12))
+                                .show(ui, |ui| {
+                                    let qr_px = 186.0;
+                                    let (qr_rect, _) = ui.allocate_exact_size(
+                                        Vec2::splat(qr_px),
+                                        Sense::hover(),
+                                    );
+                                    let p = ui.painter();
+                                    if let Ok(code) = qrcode::QrCode::new(DONATE_URL.as_bytes()) {
+                                        let width = code.width();
+                                        let cell = qr_px / width as f32;
+                                        for y in 0..width {
+                                            for x in 0..width {
+                                                if code[(x, y)] == qrcode::Color::Dark {
+                                                    let min = Pos2::new(
+                                                        qr_rect.left() + x as f32 * cell,
+                                                        qr_rect.top() + y as f32 * cell,
+                                                    );
+                                                    let max = Pos2::new(
+                                                        min.x + cell + 0.35,
+                                                        min.y + cell + 0.35,
+                                                    );
+                                                    p.rect_filled(
+                                                        Rect::from_min_max(min, max),
+                                                        0.0,
+                                                        Color32::from_rgb(14, 18, 28),
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                });
+
+                            // Right: Support card & D-Pad buttons
+                            ui.vertical(|ui| {
+                                ui.add_space(4.0);
+                                ui.horizontal(|ui| {
+                                    let (ir, _) = ui.allocate_exact_size(
+                                        Vec2::splat(30.0),
+                                        Sense::hover(),
+                                    );
+                                    ui.painter().circle_filled(
+                                        ir.center(),
+                                        15.0,
+                                        Color32::from_rgba_unmultiplied(255, 221, 0, 42),
+                                    );
+                                    Self::draw_setting_icon(
+                                        ui.painter(),
+                                        ir.center(),
+                                        15,
+                                        coffee_gold,
+                                    );
+                                    ui.label(
+                                        RichText::new("Support Development")
+                                            .font(FontId::proportional(17.5))
+                                            .strong()
+                                            .color(Color32::WHITE),
+                                    );
+                                });
+                                ui.add_space(8.0);
+                                ui.label(
+                                    RichText::new(
+                                        "Enjoying Astryx Rust Launcher? Scan the QR code with your phone camera to support updates and new features via Buy Me a Coffee.",
+                                    )
+                                    .font(FontId::proportional(12.5))
+                                    .color(Color32::from_rgb(200, 214, 236)),
+                                );
+                                ui.add_space(12.0);
+                                egui::Frame::NONE
+                                    .fill(Color32::from_rgba_unmultiplied(255, 221, 0, 24))
+                                    .stroke(Stroke::new(
+                                        1.0_f32,
+                                        Color32::from_rgba_unmultiplied(255, 221, 0, 110),
+                                    ))
+                                    .corner_radius(CornerRadius::same(10))
+                                    .inner_margin(egui::Margin::symmetric(12, 7))
+                                    .show(ui, |ui| {
+                                        ui.label(
+                                            RichText::new("buymeacoffee.com/BurbsKlopek")
+                                                .font(FontId::proportional(13.0))
+                                                .strong()
+                                                .color(coffee_gold),
+                                        );
+                                    });
+                                ui.add_space(18.0);
+                                ui.horizontal(|ui| {
+                                    if Self::modal_btn(
+                                        ui,
+                                        "Open in Browser",
+                                        true,
+                                        this.modal_focus == 0,
+                                        accent,
+                                    ) {
+                                        action = Some(0);
+                                    }
+                                    ui.add_space(8.0);
+                                    if Self::modal_btn(
+                                        ui,
+                                        "Back",
+                                        false,
+                                        this.modal_focus == 1,
+                                        accent,
+                                    ) {
+                                        action = Some(1);
+                                    }
+                                });
+                            });
+                        });
+                    },
+                );
+
+                if let Some(a) = action {
+                    match a {
+                        0 => {
+                            if !bridge::open_url(DONATE_URL) {
+                                self.show_toast("Scan the QR code with your phone camera");
+                            }
+                        }
+                        _ => {
+                            self.close_modal_step();
+                        }
+                    }
+                }
             }
         }
     }
