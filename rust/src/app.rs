@@ -110,11 +110,13 @@ pub struct AstryxTvApp {
     focus_changed: bool,
     focus_changed_at: Instant,
     modal: ActiveModal,
+    modal_stack: Vec<(ActiveModal, usize)>,
     modal_focus: usize,
     modal_just_opened: bool,
     modal_wait_key_release: bool,
     modal_focus_changed: bool,
     modal_opened_at: Instant,
+    last_back_handled: Instant,
     last_sat_refresh: Instant,
     settings_sys_col: usize,
     select_down_since: Option<Instant>,
@@ -217,11 +219,13 @@ impl AstryxTvApp {
             } else {
                 ActiveModal::None
             },
+            modal_stack: Vec::new(),
             modal_focus: if show_welcome { 4 } else { 0 },
             modal_just_opened: false,
             modal_wait_key_release: false,
             modal_focus_changed: false,
             modal_opened_at: now,
+            last_back_handled: now - Duration::from_secs(2),
             last_sat_refresh: now,
             settings_sys_col: 0,
             select_down_since: None,
@@ -303,12 +307,34 @@ impl AstryxTvApp {
     }
 
     fn open_modal(&mut self, modal: ActiveModal) {
+        if modal == ActiveModal::None {
+            self.modal_stack.clear();
+        } else if self.modal != ActiveModal::None && self.modal != modal {
+            self.modal_stack.push((self.modal.clone(), self.modal_focus));
+        }
         self.modal = modal;
         self.modal_focus = 0;
         self.modal_just_opened = true;
         self.modal_wait_key_release = true;
         self.modal_focus_changed = true;
         self.modal_opened_at = Instant::now();
+    }
+
+    fn close_modal_step(&mut self) {
+        if self.modal == ActiveModal::Welcome {
+            self.config.onboarding_done = true;
+            self.save_config();
+        }
+        if let Some((prev_modal, prev_focus)) = self.modal_stack.pop() {
+            self.modal = prev_modal;
+            self.modal_focus = prev_focus;
+            self.modal_just_opened = true;
+            self.modal_wait_key_release = true;
+            self.modal_focus_changed = true;
+            self.modal_opened_at = Instant::now();
+        } else {
+            self.modal = ActiveModal::None;
+        }
     }
 
     fn display_label(&self, app: &TvAppInfo) -> String {
@@ -2201,15 +2227,12 @@ impl AstryxTvApp {
     ) {
         // Handle Android TV remote BACK button (KEYCODE_BACK) and keyboard Escape/Backspace
         let is_text_modal = matches!(self.modal, ActiveModal::Search | ActiveModal::RenameApp(_));
-        if bridge::take_back_pressed()
-            || ctx.input(|i| i.key_pressed(Key::Escape))
-            || (!is_text_modal && ctx.input(|i| i.key_pressed(Key::Backspace)))
-        {
-            if self.modal == ActiveModal::Welcome {
-                self.config.onboarding_done = true;
-                self.save_config();
-            }
-            self.modal = ActiveModal::None;
+        let jni_back = bridge::take_back_pressed();
+        let key_back = ctx.input(|i| i.key_pressed(Key::Escape))
+            || (!is_text_modal && ctx.input(|i| i.key_pressed(Key::Backspace)));
+        if (jni_back || key_back) && self.last_back_handled.elapsed() > Duration::from_millis(260) {
+            self.last_back_handled = Instant::now();
+            self.close_modal_step();
             return;
         }
 
@@ -2276,7 +2299,7 @@ impl AstryxTvApp {
                                     )
                                     .clicked()
                                 {
-                                    self.modal = ActiveModal::None;
+                                    self.close_modal_step();
                                 }
                             });
                         });
@@ -3425,6 +3448,7 @@ impl AstryxTvApp {
                 }
 
                 let apply_setting = |this: &mut Self, idx: usize| match idx {
+                    // Category 1: LAYOUT & DISPLAY (0..6)
                     0 => {
                         this.config.layout_style = match this.config.layout_style {
                             LayoutStyle::Zenith => LayoutStyle::Classic,
@@ -3449,22 +3473,20 @@ impl AstryxTvApp {
                         this.save_config();
                     }
                     3 => {
-                        this.config.sort_order = match this.config.sort_order {
-                            SortOrder::Alpha => SortOrder::Recent,
-                            SortOrder::Recent => SortOrder::Alpha,
-                        };
-                        this.save_config();
-                    }
-                    4 => {
                         this.config.show_header = !this.config.show_header;
                         this.save_config();
                     }
-                    5 => {
-                        this.config.show_weather = !this.config.show_weather;
+                    4 => {
+                        this.config.show_labels = !this.config.show_labels;
                         this.save_config();
                     }
+                    5 => {
+                        this.config.auto_night_dim = !this.config.auto_night_dim;
+                        this.save_config();
+                    }
+                    // Category 2: WEATHER & STATUS (6..9)
                     6 => {
-                        this.config.show_labels = !this.config.show_labels;
+                        this.config.show_weather = !this.config.show_weather;
                         this.save_config();
                     }
                     7 => {
@@ -3475,8 +3497,12 @@ impl AstryxTvApp {
                         this.config.show_status_pill = !this.config.show_status_pill;
                         this.save_config();
                     }
+                    // Category 3: APPS & LIBRARY (9..12)
                     9 => {
-                        this.config.auto_night_dim = !this.config.auto_night_dim;
+                        this.config.sort_order = match this.config.sort_order {
+                            SortOrder::Alpha => SortOrder::Recent,
+                            SortOrder::Recent => SortOrder::Alpha,
+                        };
                         this.save_config();
                     }
                     10 => {
@@ -3484,19 +3510,20 @@ impl AstryxTvApp {
                         this.save_config();
                     }
                     11 => {
+                        this.config.hidden_apps.clear();
+                        this.save_config();
+                        this.show_toast("Restored all hidden apps");
+                    }
+                    // Category 4: SYSTEM & UPDATES (12..15)
+                    12 => {
                         this.config.show_system_apps = !this.config.show_system_apps;
                         this.save_config();
                     }
-                    12 => {
+                    13 => {
                         let ok = bridge::open_home_settings();
                         if !ok {
                             this.show_toast("Open Android Settings → Apps → Default Home");
                         }
-                    }
-                    13 => {
-                        this.config.hidden_apps.clear();
-                        this.save_config();
-                        this.show_toast("Restored all hidden apps");
                     }
                     14 => {
                         this.open_modal(ActiveModal::Updater);
@@ -3631,20 +3658,12 @@ impl AstryxTvApp {
                         });
                         ui.add_space(10.0);
 
-                        // (label, value, is_on, icon_id)
+                        // (label, value, is_on, icon_id) — grouped in exact multiples of 3!
                         let rows: [(&str, String, bool, usize); SETTING_COUNT] = [
+                            // LAYOUT & DISPLAY (0..6)
                             ("Layout Style", this.config.layout_style.label().to_string(), true, 0),
                             ("Settings View", this.config.settings_view.label().to_string(), true, 201),
                             ("Icon Size", this.config.icon_size.label().to_string(), true, 1),
-                            (
-                                "App Sort Order",
-                                match this.config.sort_order {
-                                    SortOrder::Alpha => "A–Z".to_string(),
-                                    SortOrder::Recent => "Recent".to_string(),
-                                },
-                                true,
-                                2,
-                            ),
                             (
                                 "Clock & Weather Header",
                                 if this.config.show_header { "ON" } else { "OFF" }.to_string(),
@@ -3652,16 +3671,23 @@ impl AstryxTvApp {
                                 3,
                             ),
                             (
-                                "Live London Weather",
-                                if this.config.show_weather { "ON" } else { "OFF" }.to_string(),
-                                this.config.show_weather,
-                                4,
-                            ),
-                            (
                                 "Show App Labels",
                                 if this.config.show_labels { "ON" } else { "OFF" }.to_string(),
                                 this.config.show_labels,
                                 5,
+                            ),
+                            (
+                                "Auto Night Dimming",
+                                if this.config.auto_night_dim { "ON" } else { "OFF" }.to_string(),
+                                this.config.auto_night_dim,
+                                8,
+                            ),
+                            // WEATHER & STATUS (6..9)
+                            (
+                                "Live London Weather",
+                                if this.config.show_weather { "ON" } else { "OFF" }.to_string(),
+                                this.config.show_weather,
+                                4,
                             ),
                             (
                                 "24-Hour UK Clock",
@@ -3675,11 +3701,15 @@ impl AstryxTvApp {
                                 this.config.show_status_pill,
                                 7,
                             ),
+                            // APPS & LIBRARY (9..12)
                             (
-                                "Auto Night Dimming",
-                                if this.config.auto_night_dim { "ON" } else { "OFF" }.to_string(),
-                                this.config.auto_night_dim,
-                                8,
+                                "App Sort Order",
+                                match this.config.sort_order {
+                                    SortOrder::Alpha => "A–Z".to_string(),
+                                    SortOrder::Recent => "Recent".to_string(),
+                                },
+                                true,
+                                2,
                             ),
                             (
                                 "Mobile / Sideloaded",
@@ -3687,6 +3717,13 @@ impl AstryxTvApp {
                                 this.config.show_mobile_apps,
                                 9,
                             ),
+                            (
+                                "Hidden Apps",
+                                format!("Unhide ({})", this.config.hidden_apps.len()),
+                                false,
+                                12,
+                            ),
+                            // SYSTEM & UPDATES (12..15)
                             (
                                 "System Apps",
                                 if this.config.show_system_apps { "ON" } else { "OFF" }.to_string(),
@@ -3704,12 +3741,6 @@ impl AstryxTvApp {
                                 11,
                             ),
                             (
-                                "Hidden Apps",
-                                format!("Unhide ({})", this.config.hidden_apps.len()),
-                                false,
-                                12,
-                            ),
-                            (
                                 "App Updates",
                                 match &this.updater_state {
                                     UpdaterState::Available(r) => format!("v{} ›", r.version),
@@ -3724,11 +3755,56 @@ impl AstryxTvApp {
                             ),
                         ];
 
+                        let category_for = |idx: usize| -> Option<&'static str> {
+                            match idx {
+                                0 => Some("LAYOUT & DISPLAY"),
+                                6 => Some("WEATHER & STATUS"),
+                                9 => Some("APPS & LIBRARY"),
+                                12 => Some("SYSTEM & UPDATES"),
+                                _ => None,
+                            }
+                        };
+
+                        let draw_category_header = |ui: &mut Ui, title: &str, top_gap: bool| {
+                            if top_gap {
+                                ui.add_space(6.0);
+                            }
+                            ui.horizontal(|ui| {
+                                let (bar_r, _) =
+                                    ui.allocate_exact_size(Vec2::new(4.0, 13.0), Sense::hover());
+                                ui.painter().rect_filled(bar_r, CornerRadius::same(2), accent);
+                                ui.label(
+                                    RichText::new(title)
+                                        .font(FontId::proportional(10.5))
+                                        .strong()
+                                        .color(accent),
+                                );
+                                let avail = ui.available_width();
+                                if avail > 12.0 {
+                                    let (lr, _) =
+                                        ui.allocate_exact_size(Vec2::new(avail, 13.0), Sense::hover());
+                                    let y = lr.center().y;
+                                    ui.painter().line_segment(
+                                        [Pos2::new(lr.left() + 4.0, y), Pos2::new(lr.right(), y)],
+                                        Stroke::new(
+                                            1.0_f32,
+                                            Color32::from_rgba_unmultiplied(255, 255, 255, 22),
+                                        ),
+                                    );
+                                }
+                            });
+                            ui.add_space(4.0);
+                        };
+
                         let mut clicked_idx: Option<usize> = None;
 
                         if this.config.settings_view == SettingsViewMode::Grid {
-                            // 3-Column Glass Card Grid View
+                            // 3-Column Categorized Glass Card Grid View
                             for (row_i, chunk) in rows.chunks(GRID_COLS).enumerate() {
+                                let first_idx = row_i * GRID_COLS;
+                                if let Some(cat) = category_for(first_idx) {
+                                    draw_category_header(ui, cat, first_idx > 0);
+                                }
                                 ui.columns(GRID_COLS, |cols| {
                                     for (c_i, (label, val, is_on, icon_id)) in chunk.iter().enumerate() {
                                         let idx = row_i * GRID_COLS + c_i;
@@ -3826,25 +3902,10 @@ impl AstryxTvApp {
                                 ui.add_space(6.0);
                             }
                         } else {
-                            // Classic Grouped List View
+                            // Classic Categorized List View
                             for (idx, (label, val, is_on, icon_id)) in rows.iter().enumerate() {
-                                let section = match idx {
-                                    0 => Some("LAYOUT & APPEARANCE"),
-                                    4 => Some("DISPLAY & OVERLAYS"),
-                                    10 => Some("APPS & SYSTEM"),
-                                    _ => None,
-                                };
-                                if let Some(sec) = section {
-                                    if idx > 0 {
-                                        ui.add_space(6.0);
-                                    }
-                                    ui.label(
-                                        RichText::new(sec)
-                                            .font(FontId::proportional(10.5))
-                                            .strong()
-                                            .color(accent),
-                                    );
-                                    ui.add_space(3.0);
+                                if let Some(sec) = category_for(idx) {
+                                    draw_category_header(ui, sec, idx > 0);
                                 }
 
                                 let focused = this.modal_focus == idx;
@@ -4367,7 +4428,7 @@ impl AstryxTvApp {
                         self.save_config();
                         self.show_toast("Reset app name to default");
                     }
-                    self.modal = ActiveModal::None;
+                    self.close_modal_step();
                 }
             }
 
@@ -4802,7 +4863,7 @@ impl AstryxTvApp {
                                 self.spawn_check_update(ctx.clone(), false);
                             }
                             _ => {
-                                self.modal = ActiveModal::None;
+                                self.close_modal_step();
                             }
                         },
                         _ => {}
@@ -5542,26 +5603,65 @@ impl eframe::App for AstryxTvApp {
         // Active modal overlay
         self.render_modals(ctx, &visible);
 
-        // Toast notification
+        // Toast notification (single-line auto-sized frosted pill, clear of top bar & bottom dock)
         if let Some((msg, at)) = &self.toast {
-            if at.elapsed() < Duration::from_secs(3) {
+            let elapsed = at.elapsed();
+            if elapsed < Duration::from_secs(3) {
                 let accent = self.config.accent();
+                let fade = if elapsed.as_secs_f32() > 2.65 {
+                    ((3.0 - elapsed.as_secs_f32()) / 0.35).clamp(0.0, 1.0)
+                } else {
+                    1.0
+                };
+                if fade < 1.0 {
+                    ctx.request_repaint();
+                } else {
+                    ctx.request_repaint_after(Duration::from_millis(250));
+                }
+                let bg_a = (232.0 * fade) as u8;
+                let st_a = (255.0 * fade) as u8;
+                let tx_a = (255.0 * fade) as u8;
+
                 egui::Area::new(egui::Id::new("toast"))
-                    .anchor(Align2::CENTER_BOTTOM, Vec2::new(0.0, -24.0))
+                    .anchor(Align2::CENTER_TOP, Vec2::new(0.0, 74.0))
                     .order(egui::Order::Tooltip)
+                    .interactable(false)
                     .show(ctx, |ui| {
                         egui::Frame::NONE
-                            .fill(Color32::from_rgba_unmultiplied(14, 18, 30, 235))
-                            .stroke(Stroke::new(1.5, accent))
-                            .corner_radius(CornerRadius::same(14))
-                            .inner_margin(egui::Margin::symmetric(16, 8))
+                            .fill(Color32::from_rgba_unmultiplied(12, 16, 28, bg_a))
+                            .stroke(Stroke::new(
+                                1.5_f32,
+                                Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), st_a),
+                            ))
+                            .corner_radius(CornerRadius::same(18))
+                            .inner_margin(egui::Margin::symmetric(18, 9))
                             .show(ui, |ui| {
-                                ui.label(
-                                    RichText::new(msg)
-                                        .font(FontId::proportional(13.5))
-                                        .strong()
-                                        .color(Color32::WHITE),
-                                );
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 8.0;
+                                    let (dr, _) =
+                                        ui.allocate_exact_size(Vec2::splat(8.0), Sense::hover());
+                                    ui.painter().circle_filled(
+                                        dr.center(),
+                                        3.8,
+                                        Color32::from_rgba_unmultiplied(
+                                            accent.r(),
+                                            accent.g(),
+                                            accent.b(),
+                                            st_a,
+                                        ),
+                                    );
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(msg)
+                                                .font(FontId::proportional(13.5))
+                                                .strong()
+                                                .color(Color32::from_rgba_unmultiplied(
+                                                    255, 255, 255, tx_a,
+                                                )),
+                                        )
+                                        .extend(),
+                                    );
+                                });
                             });
                     });
             } else {
