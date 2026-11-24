@@ -19,3 +19,8 @@ A **Pure Native Rust** Android TV launcher powered by OpenGL ES (`eframe` / `egu
 - `rust/` — Pure Native Rust OpenGL ES launcher (`src/app.rs`, `src/theme.rs`, `src/weather.rs`, `src/a2ui.rs`, `src/bridge.rs`) + patched `vendor/egui_glow` (highp UVs) & `vendor/egui-winit` (Android Back/Menu keys).
 - `android-rust/` — Minimal `NativeActivity` Gradle host (`RustLauncherActivity.kt`) for `armeabi-v7a` and `arm64-v8a`.
 - `web/` & `android/` — Original WebView prototype (kept for reference).
+
+## Support
+If you enjoy Astryx Rust Launcher and want to support ongoing updates and new features:
+
+[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-burbsklopek-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=000000)](https://buymeacoffee.com/burbsklopek)

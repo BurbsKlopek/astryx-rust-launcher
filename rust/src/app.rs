@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const PREF_CONFIG_KEY: &str = "astryx_rust_config_v1";
-const DONATE_URL: &str = "https://buymeacoffee.com/BurbsKlopek";
+const DONATE_URL: &str = "https://buymeacoffee.com/burbsklopek";
 
 enum BgMsg {
     AppsLoaded(Vec<TvAppInfo>),
@@ -5494,7 +5494,7 @@ impl AstryxTvApp {
                                     .inner_margin(egui::Margin::symmetric(12, 7))
                                     .show(ui, |ui| {
                                         ui.label(
-                                            RichText::new("buymeacoffee.com/BurbsKlopek")
+                                            RichText::new("buymeacoffee.com/burbsklopek")
                                                 .font(FontId::proportional(13.0))
                                                 .strong()
                                                 .color(coffee_gold),
