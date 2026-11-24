@@ -211,6 +211,10 @@ pub struct LauncherConfig {
     pub overlay_show_net: bool,
     #[serde(default)]
     pub overlay_show_ram: bool,
+    #[serde(default = "default_true")]
+    pub overlay_show_cpu: bool,
+    #[serde(default = "default_true")]
+    pub overlay_show_gpu: bool,
     pub icon_size: IconSize,
     pub sort_order: SortOrder,
     pub show_header: bool,
@@ -250,6 +254,8 @@ impl Default for LauncherConfig {
             overlay_show_hz: true,
             overlay_show_net: true,
             overlay_show_ram: false,
+            overlay_show_cpu: true,
+            overlay_show_gpu: true,
             icon_size: IconSize::Standard,
             sort_order: SortOrder::Alpha,
             show_header: true,
@@ -320,6 +326,12 @@ impl LauncherConfig {
         }
         if self.overlay_show_ram {
             f |= 8;
+        }
+        if self.overlay_show_cpu {
+            f |= 16;
+        }
+        if self.overlay_show_gpu {
+            f |= 32;
         }
         f
     }

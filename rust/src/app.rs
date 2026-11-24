@@ -118,6 +118,7 @@ pub struct AstryxTvApp {
     modal: ActiveModal,
     modal_stack: Vec<(ActiveModal, usize)>,
     modal_focus: usize,
+    modal_close_focused: bool,
     modal_just_opened: bool,
     modal_wait_key_release: bool,
     modal_focus_changed: bool,
@@ -232,6 +233,7 @@ impl AstryxTvApp {
             },
             modal_stack: Vec::new(),
             modal_focus: if show_welcome { 4 } else { 0 },
+            modal_close_focused: false,
             modal_just_opened: false,
             modal_wait_key_release: false,
             modal_focus_changed: false,
@@ -329,6 +331,7 @@ impl AstryxTvApp {
         }
         self.modal = modal;
         self.modal_focus = 0;
+        self.modal_close_focused = false;
         self.modal_just_opened = true;
         self.modal_wait_key_release = true;
         self.modal_focus_changed = true;
@@ -340,6 +343,7 @@ impl AstryxTvApp {
             self.config.onboarding_done = true;
             self.save_config();
         }
+        self.modal_close_focused = false;
         if let Some((prev_modal, prev_focus)) = self.modal_stack.pop() {
             self.modal = prev_modal;
             self.modal_focus = prev_focus;
@@ -2315,6 +2319,17 @@ impl AstryxTvApp {
                                     .color(Color32::WHITE),
                             );
                             ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                                let close_focused = self.modal_close_focused;
+                                let close_fill = if close_focused {
+                                    accent
+                                } else {
+                                    Color32::from_rgba_unmultiplied(255, 255, 255, 22)
+                                };
+                                let close_stroke = if close_focused {
+                                    Stroke::new(2.0_f32, Color32::WHITE)
+                                } else {
+                                    Stroke::new(1.0_f32, accent)
+                                };
                                 if ui
                                     .add(
                                         egui::Button::new(
@@ -2323,8 +2338,8 @@ impl AstryxTvApp {
                                                 .strong()
                                                 .color(Color32::WHITE),
                                         )
-                                        .fill(Color32::from_rgba_unmultiplied(255, 255, 255, 22))
-                                        .stroke(Stroke::new(1.0, accent))
+                                        .fill(close_fill)
+                                        .stroke(close_stroke)
                                         .corner_radius(CornerRadius::same(10)),
                                     )
                                     .clicked()
@@ -2387,8 +2402,26 @@ impl AstryxTvApp {
         if self.modal_wait_key_release && !select_down {
             self.modal_wait_key_release = false;
         }
-        let allow_keys = !self.modal_just_opened && !self.modal_wait_key_release;
+        let mut allow_keys = !self.modal_just_opened && !self.modal_wait_key_release;
         self.modal_just_opened = false;
+
+        // If D-Pad focus is on the top-right "✕ Close" button, handle OK / Down cleanly here
+        if self.modal_close_focused && allow_keys {
+            let (ok, down) = ctx.input(|i| {
+                (
+                    i.key_pressed(Key::Enter) || i.key_pressed(Key::Space),
+                    i.key_pressed(Key::ArrowDown),
+                )
+            });
+            if ok {
+                self.close_modal_step();
+                return;
+            }
+            if down {
+                self.modal_close_focused = false;
+            }
+            allow_keys = false;
+        }
 
         match self.modal.clone() {
             ActiveModal::None => {}
@@ -2407,10 +2440,12 @@ impl AstryxTvApp {
                             0 => {
                                 if right { self.modal_focus = 1; }
                                 else if down { self.modal_focus = 2; }
+                                else if up { self.modal_close_focused = true; }
                             }
                             1 => {
                                 if left { self.modal_focus = 0; }
                                 else if down { self.modal_focus = 3; }
+                                else if up { self.modal_close_focused = true; }
                             }
                             2 => {
                                 if right { self.modal_focus = 3; }
@@ -3006,9 +3041,13 @@ impl AstryxTvApp {
                             } else if right && col + 1 < THEME_COLS && self.modal_focus + 1 < THEME_COUNT {
                                 self.modal_focus += 1;
                                 self.modal_focus_changed = true;
-                            } else if up && self.modal_focus >= THEME_COLS {
-                                self.modal_focus -= THEME_COLS;
-                                self.modal_focus_changed = true;
+                            } else if up {
+                                if self.modal_focus >= THEME_COLS {
+                                    self.modal_focus -= THEME_COLS;
+                                    self.modal_focus_changed = true;
+                                } else {
+                                    self.modal_close_focused = true;
+                                }
                             } else if down && self.modal_focus + THEME_COLS < THEME_COUNT {
                                 self.modal_focus += THEME_COLS;
                                 self.modal_focus_changed = true;
@@ -3020,8 +3059,12 @@ impl AstryxTvApp {
                                 self.modal_focus = (self.modal_focus + 1).min(THEME_COUNT - 1);
                                 self.modal_focus_changed = true;
                             } else if up {
-                                self.modal_focus = self.modal_focus.saturating_sub(1);
-                                self.modal_focus_changed = true;
+                                if self.modal_focus == 0 {
+                                    self.modal_close_focused = true;
+                                } else {
+                                    self.modal_focus -= 1;
+                                    self.modal_focus_changed = true;
+                                }
                             } else if ok || right {
                                 step_dir = 1;
                             } else if left {
@@ -3444,9 +3487,13 @@ impl AstryxTvApp {
                                 } else if right && col + 1 < GRID_COLS && self.modal_focus + 1 < SETTING_COUNT {
                                     self.modal_focus += 1;
                                     self.modal_focus_changed = true;
-                                } else if up && self.modal_focus >= GRID_COLS {
-                                    self.modal_focus -= GRID_COLS;
-                                    self.modal_focus_changed = true;
+                                } else if up {
+                                    if self.modal_focus >= GRID_COLS {
+                                        self.modal_focus -= GRID_COLS;
+                                        self.modal_focus_changed = true;
+                                    } else {
+                                        self.modal_close_focused = true;
+                                    }
                                 } else if down {
                                     if self.modal_focus + GRID_COLS < SETTING_COUNT {
                                         self.modal_focus += GRID_COLS;
@@ -3465,8 +3512,12 @@ impl AstryxTvApp {
                                 self.modal_focus = (self.modal_focus + 1).min(SYS_IDX);
                                 self.modal_focus_changed = true;
                             } else if up {
-                                self.modal_focus = self.modal_focus.saturating_sub(1);
-                                self.modal_focus_changed = true;
+                                if self.modal_focus == 0 {
+                                    self.modal_close_focused = true;
+                                } else {
+                                    self.modal_focus -= 1;
+                                    self.modal_focus_changed = true;
+                                }
                             } else if left {
                                 left_key = true;
                             } else if right {
@@ -3772,7 +3823,7 @@ impl AstryxTvApp {
                                 if this.is_default_home {
                                     "✓ Default".to_string()
                                 } else {
-                                    "Set Default ›".to_string()
+                                    "Set Default".to_string()
                                 },
                                 this.is_default_home,
                                 11,
@@ -3780,12 +3831,12 @@ impl AstryxTvApp {
                             (
                                 "App Updates",
                                 match &this.updater_state {
-                                    UpdaterState::Available(r) => format!("v{} ›", r.version),
+                                    UpdaterState::Available(r) => format!("v{} NEW", r.version),
                                     UpdaterState::Downloading { .. } => "Downloading".to_string(),
                                     UpdaterState::ReadyToInstall { .. }
-                                    | UpdaterState::NeedPermission { .. } => "Install ›".to_string(),
+                                    | UpdaterState::NeedPermission { .. } => "Install".to_string(),
                                     UpdaterState::Checking => "Checking...".to_string(),
-                                    _ => format!("v{} ›", this.app_version),
+                                    _ => format!("v{}", this.app_version),
                                 },
                                 this.has_update_available(),
                                 13,
@@ -3793,14 +3844,16 @@ impl AstryxTvApp {
                             (
                                 "HUD Overlay",
                                 if this.config.show_fps_meter {
-                                    "ON ›".to_string()
+                                    "ON".to_string()
                                 } else {
-                                    "OFF ›".to_string()
+                                    "OFF".to_string()
                                 },
                                 this.config.show_fps_meter,
                                 14,
                             ),
                         ];
+
+                        let is_submenu_item = |idx: usize| matches!(idx, 13 | 14 | 15);
 
                         let category_for = |idx: usize| -> Option<&'static str> {
                             match idx {
@@ -3856,6 +3909,7 @@ impl AstryxTvApp {
                                     for (c_i, (label, val, is_on, icon_id)) in chunk.iter().enumerate() {
                                         let idx = row_i * GRID_COLS + c_i;
                                         let focused = this.modal_focus == idx;
+                                        let is_sub = is_submenu_item(idx);
                                         let w = cols[c_i].available_width();
                                         let (rect, resp) = cols[c_i]
                                             .allocate_exact_size(Vec2::new(w, 60.0), Sense::click());
@@ -3866,6 +3920,8 @@ impl AstryxTvApp {
                                             CornerRadius::same(12),
                                             if focused {
                                                 Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 48)
+                                            } else if is_sub {
+                                                Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 18)
                                             } else {
                                                 Color32::from_rgba_unmultiplied(255, 255, 255, 11)
                                             },
@@ -3875,6 +3931,11 @@ impl AstryxTvApp {
                                             CornerRadius::same(12),
                                             if focused {
                                                 Stroke::new(2.0_f32, accent)
+                                            } else if is_sub {
+                                                Stroke::new(
+                                                    1.1_f32,
+                                                    Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 95),
+                                                )
                                             } else {
                                                 Stroke::new(
                                                     1.0_f32,
@@ -3936,6 +3997,29 @@ impl AstryxTvApp {
                                             if focused { Color32::WHITE } else { Color32::from_rgb(225, 233, 246) },
                                         );
 
+                                        // Bottom-right sub-menu chevron badge for folder/sub-menu cards
+                                        if is_sub {
+                                            let ch_c = Pos2::new(rect.right() - 18.0, rect.bottom() - 14.0);
+                                            p.circle_filled(
+                                                ch_c,
+                                                8.5,
+                                                if focused {
+                                                    Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 145)
+                                                } else {
+                                                    Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 52)
+                                                },
+                                            );
+                                            let chev_c = if focused { Color32::WHITE } else { accent };
+                                            p.add(egui::Shape::line(
+                                                vec![
+                                                    ch_c + Vec2::new(-1.8, -3.4),
+                                                    ch_c + Vec2::new(2.2, 0.0),
+                                                    ch_c + Vec2::new(-1.8, 3.4),
+                                                ],
+                                                Stroke::new(1.8_f32, chev_c),
+                                            ));
+                                        }
+
                                         if focused && this.modal_focus_changed {
                                             resp.scroll_to_me(Some(Align::Center));
                                             this.modal_focus_changed = false;
@@ -3956,14 +4040,22 @@ impl AstryxTvApp {
                                 }
 
                                 let focused = this.modal_focus == idx;
+                                let is_sub = is_submenu_item(idx);
                                 let row_resp = egui::Frame::NONE
                                     .fill(if focused {
                                         Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 38)
+                                    } else if is_sub {
+                                        Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 15)
                                     } else {
                                         Color32::from_rgba_unmultiplied(255, 255, 255, 9)
                                     })
                                     .stroke(if focused {
                                         Stroke::new(1.5_f32, accent)
+                                    } else if is_sub {
+                                        Stroke::new(
+                                            1.0_f32,
+                                            Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 85),
+                                        )
                                     } else {
                                         Stroke::new(
                                             1.0_f32,
@@ -4014,6 +4106,24 @@ impl AstryxTvApp {
                                                     }),
                                             );
                                             ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                                                if is_sub {
+                                                    let (ch_r, _) = ui.allocate_exact_size(Vec2::splat(20.0), Sense::hover());
+                                                    let ch_c = ch_r.center();
+                                                    ui.painter().circle_filled(
+                                                        ch_c,
+                                                        9.0,
+                                                        Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 62),
+                                                    );
+                                                    ui.painter().add(egui::Shape::line(
+                                                        vec![
+                                                            ch_c + Vec2::new(-2.0, -3.6),
+                                                            ch_c + Vec2::new(2.2, 0.0),
+                                                            ch_c + Vec2::new(-2.0, 3.6),
+                                                        ],
+                                                        Stroke::new(1.8_f32, if focused { Color32::WHITE } else { accent }),
+                                                    ));
+                                                    ui.add_space(4.0);
+                                                }
                                                 let pill_fill = if focused {
                                                     Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 95)
                                                 } else if *is_on {
@@ -4491,6 +4601,8 @@ impl AstryxTvApp {
                             self.modal_focus = self.modal_focus.saturating_sub(1);
                         } else if i.key_pressed(Key::ArrowRight) {
                             self.modal_focus = (self.modal_focus + 1).min(1);
+                        } else if i.key_pressed(Key::ArrowUp) {
+                            self.modal_close_focused = true;
                         } else if i.key_pressed(Key::Enter) || i.key_pressed(Key::Space) {
                             action = Some(self.modal_focus as u8);
                         }
@@ -4919,7 +5031,7 @@ impl AstryxTvApp {
             }
 
             ActiveModal::Overlay => {
-                const ROW_COUNT: usize = 5;
+                const ROW_COUNT: usize = 7;
                 let mut trigger = false;
                 if allow_keys {
                     ctx.input(|i| {
@@ -4927,8 +5039,12 @@ impl AstryxTvApp {
                             self.modal_focus = (self.modal_focus + 1).min(ROW_COUNT - 1);
                             self.modal_focus_changed = true;
                         } else if i.key_pressed(Key::ArrowUp) {
-                            self.modal_focus = self.modal_focus.saturating_sub(1);
-                            self.modal_focus_changed = true;
+                            if self.modal_focus == 0 {
+                                self.modal_close_focused = true;
+                            } else {
+                                self.modal_focus -= 1;
+                                self.modal_focus_changed = true;
+                            }
                         } else if i.key_pressed(Key::Enter)
                             || i.key_pressed(Key::Space)
                             || i.key_pressed(Key::ArrowLeft)
@@ -4944,8 +5060,10 @@ impl AstryxTvApp {
                         0 => this.config.show_fps_meter = !this.config.show_fps_meter,
                         1 => this.config.overlay_show_fps = !this.config.overlay_show_fps,
                         2 => this.config.overlay_show_hz = !this.config.overlay_show_hz,
-                        3 => this.config.overlay_show_net = !this.config.overlay_show_net,
-                        4 => this.config.overlay_show_ram = !this.config.overlay_show_ram,
+                        3 => this.config.overlay_show_cpu = !this.config.overlay_show_cpu,
+                        4 => this.config.overlay_show_gpu = !this.config.overlay_show_gpu,
+                        5 => this.config.overlay_show_net = !this.config.overlay_show_net,
+                        6 => this.config.overlay_show_ram = !this.config.overlay_show_ram,
                         _ => {}
                     }
                     this.fps_frame_count = 0;
@@ -4976,8 +5094,8 @@ impl AstryxTvApp {
                 self.draw_modal_shell(
                     ctx,
                     "HUD Overlay  ·  Up/Down move · OK toggle · BACK Settings",
-                    640.0,
-                    395.0,
+                    660.0,
+                    440.0,
                     |this, ui, _ctx| {
                         let accent = this.config.accent();
 
@@ -4988,6 +5106,12 @@ impl AstryxTvApp {
                         }
                         if this.config.overlay_show_hz {
                             preview_parts.push(format!("{:.0}Hz", this.display_hz));
+                        }
+                        if this.config.overlay_show_cpu {
+                            preview_parts.push("CPU 34%".to_string());
+                        }
+                        if this.config.overlay_show_gpu {
+                            preview_parts.push("GPU 18%".to_string());
                         }
                         if this.config.overlay_show_net {
                             preview_parts.push("↓ 8.4 MB/s".to_string());
@@ -5065,6 +5189,18 @@ impl AstryxTvApp {
                                 100,
                             ),
                             (
+                                "CPU Usage",
+                                "Live processor utilization (%)",
+                                this.config.overlay_show_cpu,
+                                101,
+                            ),
+                            (
+                                "GPU Usage",
+                                "Live graphics load / frame pressure (%)",
+                                this.config.overlay_show_gpu,
+                                202,
+                            ),
+                            (
                                 "Network Activity",
                                 "Live download & upload speed (KB/s · MB/s)",
                                 this.config.overlay_show_net,
@@ -5074,7 +5210,7 @@ impl AstryxTvApp {
                                 "Free Memory (RAM)",
                                 "Available system RAM in MB",
                                 this.config.overlay_show_ram,
-                                101,
+                                102,
                             ),
                         ];
 
@@ -5189,6 +5325,10 @@ impl AstryxTvApp {
                                     });
                                 })
                                 .response;
+                            if focused && this.modal_focus_changed {
+                                resp.scroll_to_me(Some(Align::Center));
+                                this.modal_focus_changed = false;
+                            }
                             if resp.clicked() {
                                 this.modal_focus = idx;
                                 clicked = Some(idx);

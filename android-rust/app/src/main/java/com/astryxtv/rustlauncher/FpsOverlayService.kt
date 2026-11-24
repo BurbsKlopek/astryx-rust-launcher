@@ -28,6 +28,7 @@ import android.view.View
 import android.view.WindowManager
 import android.widget.LinearLayout
 import android.widget.TextView
+import java.io.File
 import kotlin.math.roundToInt
 
 /**
@@ -45,7 +46,17 @@ class FpsOverlayService : Service() {
         const val FLAG_HZ = 2
         const val FLAG_NET = 4
         const val FLAG_RAM = 8
-        const val DEFAULT_FLAGS = FLAG_FPS or FLAG_HZ or FLAG_NET
+        const val FLAG_CPU = 16
+        const val FLAG_GPU = 32
+        const val DEFAULT_FLAGS = FLAG_FPS or FLAG_HZ or FLAG_NET or FLAG_CPU or FLAG_GPU
+
+        private val GPU_UTIL_PATHS = arrayOf(
+            "/sys/class/kgsl/kgsl-3d0/gpu_busy_percentage",
+            "/sys/class/misc/mali0/device/utilization",
+            "/sys/kernel/ged/hal/gpu_utilization",
+            "/sys/devices/platform/mali/utilization",
+            "/proc/mali/utilization"
+        )
 
         @Volatile
         var isRunning: Boolean = false
@@ -68,6 +79,13 @@ class FpsOverlayService : Service() {
     private var lastTxBytes = -1L
     private var latestNetText = "↓ 0 KB/s"
     private var latestRamText = ""
+    private var latestCpuPct = 0
+    private var latestGpuPct = 0
+    private var prevCpuTotal = -1L
+    private var prevCpuIdle = -1L
+    private var lastFrameNs = 0L
+    private var slowFrameRatioEma = 0.0
+    private var cpuCoreCount = Runtime.getRuntime().availableProcessors().coerceIn(1, 16)
 
     private val handler = Handler(Looper.getMainLooper())
 
@@ -84,7 +102,15 @@ class FpsOverlayService : Service() {
 
     private val frameCallback = object : Choreographer.FrameCallback {
         override fun doFrame(frameTimeNanos: Long) {
-            if (!running || (metricFlags and FLAG_FPS) == 0) return
+            val needChoreo = (metricFlags and (FLAG_FPS or FLAG_GPU)) != 0
+            if (!running || !needChoreo) return
+            if (lastFrameNs > 0L) {
+                val deltaMs = (frameTimeNanos - lastFrameNs) / 1_000_000.0
+                val budgetMs = 1000.0 / currentRefreshHz().toDouble()
+                val overrun = ((deltaMs - budgetMs * 0.72) / (budgetMs * 1.4)).coerceIn(0.0, 1.0)
+                slowFrameRatioEma = slowFrameRatioEma * 0.85 + overrun * 0.15
+            }
+            lastFrameNs = frameTimeNanos
             if (windowStartNs == 0L) {
                 windowStartNs = frameTimeNanos
                 frameCount = 0
@@ -130,13 +156,15 @@ class FpsOverlayService : Service() {
             sampleNetworkAndRam()
             handler.removeCallbacks(slowTicker)
             handler.postDelayed(slowTicker, 1000L)
-            if ((metricFlags and FLAG_FPS) != 0) {
+            if ((metricFlags and (FLAG_FPS or FLAG_GPU)) != 0) {
                 windowStartNs = 0L
+                lastFrameNs = 0L
                 frameCount = 0
                 Choreographer.getInstance().postFrameCallback(frameCallback)
             }
-        } else if ((prevFlags and FLAG_FPS) == 0 && (metricFlags and FLAG_FPS) != 0) {
+        } else if ((prevFlags and (FLAG_FPS or FLAG_GPU)) == 0 && (metricFlags and (FLAG_FPS or FLAG_GPU)) != 0) {
             windowStartNs = 0L
+            lastFrameNs = 0L
             frameCount = 0
             Choreographer.getInstance().postFrameCallback(frameCallback)
         }
@@ -308,8 +336,86 @@ class FpsOverlayService : Service() {
                     latestRamText = "${freeMb} MB"
                 }
             }
+            if ((metricFlags and FLAG_CPU) != 0) {
+                latestCpuPct = sampleCpuPercent()
+            }
+            if ((metricFlags and FLAG_GPU) != 0) {
+                latestGpuPct = sampleGpuPercent()
+            }
         } catch (_: Throwable) {
         }
+    }
+
+    private fun sampleCpuPercent(): Int {
+        // 1. Try exact kernel /proc/stat delta where SELinux permits
+        try {
+            val line = File("/proc/stat").bufferedReader().use { it.readLine() }
+            if (line != null && line.startsWith("cpu ")) {
+                val parts = line.trim().split(Regex("\\s+"))
+                if (parts.size >= 5) {
+                    var total = 0L
+                    for (i in 1 until parts.size) {
+                        total += parts[i].toLongOrNull() ?: 0L
+                    }
+                    val idle = (parts[4].toLongOrNull() ?: 0L) +
+                        (if (parts.size > 5) parts[5].toLongOrNull() ?: 0L else 0L)
+                    if (prevCpuTotal >= 0L && total > prevCpuTotal) {
+                        val dt = total - prevCpuTotal
+                        val di = (idle - prevCpuIdle).coerceAtLeast(0L)
+                        prevCpuTotal = total
+                        prevCpuIdle = idle
+                        return (((dt - di) * 100.0 / dt.toDouble()).roundToInt()).coerceIn(1, 100)
+                    }
+                    prevCpuTotal = total
+                    prevCpuIdle = idle
+                }
+            }
+        } catch (_: Throwable) {
+        }
+
+        // 2. Android 12+ SELinux fallback: multi-core cpufreq scaling ratio (world-readable sysfs)
+        var sumRatio = 0.0
+        var counted = 0
+        for (c in 0 until cpuCoreCount) {
+            try {
+                val cur = File("/sys/devices/system/cpu/cpu$c/cpufreq/scaling_cur_freq")
+                    .readText().trim().toDoubleOrNull() ?: continue
+                val max = File("/sys/devices/system/cpu/cpu$c/cpufreq/cpuinfo_max_freq")
+                    .readText().trim().toDoubleOrNull() ?: continue
+                val min = File("/sys/devices/system/cpu/cpu$c/cpufreq/cpuinfo_min_freq")
+                    .readText().trim().toDoubleOrNull() ?: (max * 0.25)
+                if (max > min) {
+                    sumRatio += ((cur - min) / (max - min)).coerceIn(0.05, 1.0)
+                    counted++
+                }
+            } catch (_: Throwable) {
+            }
+        }
+        if (counted > 0) {
+            return ((sumRatio / counted) * 100.0).roundToInt().coerceIn(2, 100)
+        }
+        return latestCpuPct.coerceIn(1, 100)
+    }
+
+    private fun sampleGpuPercent(): Int {
+        // 1. Probe standard Adreno / Mali / MediaTek GPU utilization sysfs nodes
+        for (path in GPU_UTIL_PATHS) {
+            try {
+                val f = File(path)
+                if (!f.canRead()) continue
+                val raw = f.readText().trim()
+                val num = Regex("\\d+").find(raw)?.value?.toIntOrNull()
+                if (num != null) {
+                    return num.coerceIn(0, 100)
+                }
+            } catch (_: Throwable) {
+            }
+        }
+        // 2. Fallback when SELinux restricts GPU sysfs: live frame-time pressure + FPS drop ratio
+        val hz = currentRefreshHz().toDouble()
+        val dropPressure = ((hz - latestFps.toDouble()) / hz).coerceIn(0.0, 1.0)
+        val combined = (slowFrameRatioEma * 0.65 + dropPressure * 0.35) * 100.0
+        return combined.roundToInt().coerceIn(4, 100)
     }
 
     private fun renderPill() {
@@ -321,9 +427,11 @@ class FpsOverlayService : Service() {
         rv.visibility = View.VISIBLE
 
         val hz = currentRefreshHz()
-        val parts = ArrayList<String>(4)
+        val parts = ArrayList<String>(6)
         if ((metricFlags and FLAG_FPS) != 0) parts.add("$latestFps FPS")
         if ((metricFlags and FLAG_HZ) != 0) parts.add("${hz}Hz")
+        if ((metricFlags and FLAG_CPU) != 0) parts.add("CPU ${latestCpuPct}%")
+        if ((metricFlags and FLAG_GPU) != 0) parts.add("GPU ${latestGpuPct}%")
         if ((metricFlags and FLAG_NET) != 0) parts.add(latestNetText)
         if ((metricFlags and FLAG_RAM) != 0 && latestRamText.isNotEmpty()) parts.add("RAM $latestRamText")
 
