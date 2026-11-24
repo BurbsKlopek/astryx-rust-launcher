@@ -2172,7 +2172,19 @@ impl AstryxTvApp {
                                     );
                                 }
 
-                                let icon_color = if focused {
+                                let icon_color = if idx == 1 {
+                                    if self.status.is_vpn_active {
+                                        if focused {
+                                            Color32::from_rgb(74, 222, 128)
+                                        } else {
+                                            Color32::from_rgb(52, 211, 153)
+                                        }
+                                    } else if focused {
+                                        Color32::from_rgb(252, 138, 138)
+                                    } else {
+                                        Color32::from_rgb(248, 113, 113)
+                                    }
+                                } else if focused {
                                     Color32::WHITE
                                 } else {
                                     Color32::from_rgb(225, 232, 245)
@@ -2191,11 +2203,16 @@ impl AstryxTvApp {
                                         3.2,
                                         dot_c,
                                     );
-                                } else if idx == 1 && self.status.is_vpn_active {
+                                } else if idx == 1 {
+                                    let dot_c = if self.status.is_vpn_active {
+                                        Color32::from_rgb(52, 211, 153)
+                                    } else {
+                                        Color32::from_rgb(248, 113, 113)
+                                    };
                                     p.circle_filled(
                                         rect.right_bottom() + Vec2::new(-5.0, -5.0),
                                         3.2,
-                                        Color32::from_rgb(56, 189, 248),
+                                        dot_c,
                                     );
                                 } else if idx == 6 && self.has_update_available() {
                                     p.circle_filled(
@@ -6848,16 +6865,24 @@ impl AstryxTvApp {
                                             Color32::from_rgba_unmultiplied(255, 255, 255, 16),
                                         );
                                     }
-                                    Self::draw_dock_icon(
-                                        p,
-                                        rect.center(),
-                                        idx,
-                                        if focused {
-                                            Color32::WHITE
+                                    let icon_color = if idx == 1 {
+                                        if self.status.is_vpn_active {
+                                            if focused {
+                                                Color32::from_rgb(74, 222, 128)
+                                            } else {
+                                                Color32::from_rgb(52, 211, 153)
+                                            }
+                                        } else if focused {
+                                            Color32::from_rgb(252, 138, 138)
                                         } else {
-                                            Color32::from_rgb(225, 232, 245)
-                                        },
-                                    );
+                                            Color32::from_rgb(248, 113, 113)
+                                        }
+                                    } else if focused {
+                                        Color32::WHITE
+                                    } else {
+                                        Color32::from_rgb(225, 232, 245)
+                                    };
+                                    Self::draw_dock_icon(p, rect.center(), idx, icon_color);
                                     if idx == 0 {
                                         let dot_c = if self.status.is_connected {
                                             Color32::from_rgb(52, 211, 153)
@@ -6869,11 +6894,16 @@ impl AstryxTvApp {
                                             3.0,
                                             dot_c,
                                         );
-                                    } else if idx == 1 && self.status.is_vpn_active {
+                                    } else if idx == 1 {
+                                        let dot_c = if self.status.is_vpn_active {
+                                            Color32::from_rgb(52, 211, 153)
+                                        } else {
+                                            Color32::from_rgb(248, 113, 113)
+                                        };
                                         p.circle_filled(
                                             rect.right_bottom() + Vec2::new(-4.5, -4.5),
                                             3.0,
-                                            Color32::from_rgb(56, 189, 248),
+                                            dot_c,
                                         );
                                     } else if idx == 6 && self.has_update_available() {
                                         p.circle_filled(
@@ -7532,9 +7562,9 @@ impl eframe::App for AstryxTvApp {
                                                 .font(FontId::proportional(11.0))
                                                 .strong()
                                                 .color(if self.status.is_vpn_active {
-                                                    Color32::from_rgb(56, 189, 248)
+                                                    Color32::from_rgb(52, 211, 153)
                                                 } else {
-                                                    Color32::from_rgb(175, 188, 210)
+                                                    Color32::from_rgb(248, 113, 113)
                                                 }),
                                         );
                                     });
