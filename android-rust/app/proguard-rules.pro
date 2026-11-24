@@ -8,3 +8,6 @@
 -keep class com.astryxtv.rustlauncher.FpsOverlayService {
     *;
 }
+-keep class com.astryxtv.rustlauncher.BootReceiver {
+    *;
+}

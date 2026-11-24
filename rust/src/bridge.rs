@@ -394,6 +394,16 @@ pub fn trigger_sleep() {
     });
 }
 
+pub fn open_tv_inputs() -> bool {
+    with_activity(|env, act| {
+        env.call_method(act, "rustOpenTvInputs", "()Z", &[])
+            .ok()?
+            .z()
+            .ok()
+    })
+    .unwrap_or(false)
+}
+
 pub fn export_backup(json: &str) -> String {
     with_activity(|env, act| {
         let j = env.new_string(json).ok()?;

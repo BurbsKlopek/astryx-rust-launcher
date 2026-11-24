@@ -95,6 +95,35 @@ impl WeatherScene {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum StartupMode {
+    #[default]
+    Home,
+    LaunchApp,
+    LastUsedApp,
+    HdmiInput,
+}
+
+impl StartupMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Home => "Stay on Home",
+            Self::LaunchApp => "Open Chosen App",
+            Self::LastUsedApp => "Resume Last App",
+            Self::HdmiInput => "TV / HDMI Input",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::Home => Self::LaunchApp,
+            Self::LaunchApp => Self::LastUsedApp,
+            Self::LastUsedApp => Self::HdmiInput,
+            Self::HdmiInput => Self::Home,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppFolder {
     pub name: String,
@@ -224,6 +253,10 @@ fn default_ambient() -> u32 {
     180
 }
 
+fn default_startup_delay() -> u8 {
+    2
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LauncherConfig {
     pub astryx_theme: AstryxThemeId,
@@ -281,6 +314,14 @@ pub struct LauncherConfig {
     pub custom_wallpaper_path: String,
     #[serde(default)]
     pub app_folders: Vec<AppFolder>,
+    #[serde(default)]
+    pub startup_mode: StartupMode,
+    #[serde(default)]
+    pub startup_app_pkg: String,
+    #[serde(default = "default_startup_delay")]
+    pub startup_delay_secs: u8,
+    #[serde(default)]
+    pub lightweight_mode: bool,
     pub icon_size: IconSize,
     pub sort_order: SortOrder,
     pub show_header: bool,
@@ -331,6 +372,10 @@ impl Default for LauncherConfig {
             web_companion_enabled: true,
             custom_wallpaper_path: String::new(),
             app_folders: Vec::new(),
+            startup_mode: StartupMode::Home,
+            startup_app_pkg: String::new(),
+            startup_delay_secs: default_startup_delay(),
+            lightweight_mode: false,
             icon_size: IconSize::Standard,
             sort_order: SortOrder::Alpha,
             show_header: true,

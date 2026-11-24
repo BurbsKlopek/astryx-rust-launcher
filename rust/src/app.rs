@@ -2,7 +2,7 @@ use crate::a2ui::{A2uiEngine, SAMPLE_A2UI_PAYLOAD};
 use crate::bridge::{self, TvAppInfo, TvSystemStatus};
 use crate::theme::{
     AppFolder, AstryxThemeId, FocusAnimStyle, IconSize, LauncherConfig, LayoutStyle,
-    SettingsViewMode, SortOrder, WeatherScene, ACCENT_PRESETS, WEATHER_CITY_PRESETS,
+    SettingsViewMode, SortOrder, StartupMode, WeatherScene, ACCENT_PRESETS, WEATHER_CITY_PRESETS,
 };
 use crate::updater::{self, ReleaseInfo, UpdateCheckOutcome};
 use crate::weather::{self, WeatherData};
@@ -79,6 +79,7 @@ enum ActiveModal {
     PowerMenu,
     PhoneCompanion,
     Backup,
+    StartupOptions,
     Search,
     A2ui,
     AppContext(String), // package_name
@@ -151,6 +152,8 @@ pub struct AstryxTvApp {
     last_input_at: Instant,
     ambient_active: bool,
     active_folder_idx: Option<usize>,
+    startup_pending: bool,
+    startup_started_at: Instant,
     start_time: Instant,
     last_status_poll: Instant,
     last_weather_poll: Instant,
@@ -214,6 +217,12 @@ impl AstryxTvApp {
         let local_ip = bridge::get_local_ip();
         let web_enabled = config.web_companion_enabled;
         let show_welcome = !config.onboarding_done;
+        let startup_pending = config.onboarding_done && config.startup_mode != StartupMode::Home;
+        if config.lightweight_mode {
+            cc.egui_ctx.options_mut(|o| {
+                o.tessellation_options.bezier_tolerance = 0.6;
+            });
+        }
 
         let mut app = Self {
             config,
@@ -275,6 +284,8 @@ impl AstryxTvApp {
             last_input_at: now,
             ambient_active: false,
             active_folder_idx: None,
+            startup_pending,
+            startup_started_at: now,
             start_time: now,
             last_status_poll: now - Duration::from_secs(60),
             last_weather_poll: now - Duration::from_secs(900),
@@ -573,9 +584,10 @@ impl AstryxTvApp {
         }
         self.wallpaper_loading = Some((scene, blur));
         let custom_path = self.config.custom_wallpaper_path.clone();
+        let lightweight = self.config.lightweight_mode;
         let tx = self.tx.clone();
         std::thread::spawn(move || {
-            if let Some(img) = weather::fetch_wallpaper_image(scene, blur, &custom_path) {
+            if let Some(img) = weather::fetch_wallpaper_image(scene, blur, &custom_path, lightweight) {
                 let _ = tx.send(BgMsg::WallpaperLoaded(scene, blur, img));
                 ctx.request_repaint();
             }
@@ -1248,7 +1260,7 @@ impl AstryxTvApp {
         focused: bool,
         accent: Color32,
     ) {
-        if !focused {
+        if !focused || self.config.lightweight_mode {
             return;
         }
         match self.config.focus_anim {
@@ -1305,7 +1317,9 @@ impl AstryxTvApp {
         let scene = self.active_scene();
 
         let t = self.start_time.elapsed().as_secs_f32();
-        let motion = self.config.live_sky_motion && self.modal == ActiveModal::None;
+        let motion = self.config.live_sky_motion
+            && !self.config.lightweight_mode
+            && self.modal == ActiveModal::None;
 
         // Draw single opaque wallpaper pass when loaded (scrim is pre-baked off-thread for 3x faster GPU fill-rate!)
         if let Some((loaded_scene, _, tex)) = &self.wallpaper_tex {
@@ -2554,7 +2568,7 @@ impl AstryxTvApp {
 
         let fill = self.config.modal_fill();
         let accent = self.config.accent();
-        let pop_scale = if self.config.modal_pop_in {
+        let pop_scale = if self.config.modal_pop_in && !self.config.lightweight_mode {
             let el = self.modal_opened_at.elapsed().as_secs_f32();
             if el < 0.085 {
                 ctx.request_repaint();
@@ -3719,9 +3733,9 @@ impl AstryxTvApp {
             }
 
             ActiveModal::Settings => {
-                // 25 settings (0..25, 4 clean categories) + row 25 = Android TV Shortcuts (4 columns)
-                const SETTING_COUNT: usize = 25;
-                const SYS_IDX: usize = 25;
+                // 28 settings (0..28, 4 clean categories with Theme & Glass merged in!) + row 28 = Android TV Shortcuts
+                const SETTING_COUNT: usize = 28;
+                const SYS_IDX: usize = 28;
                 const GRID_COLS: usize = 3;
                 let is_grid = self.config.settings_view == SettingsViewMode::Grid;
 
@@ -3799,8 +3813,11 @@ impl AstryxTvApp {
                 }
 
                 let apply_setting = |this: &mut Self, idx: usize| match idx {
-                    // Category 1: LAYOUT & DISPLAY (0..6)
+                    // Category 1: LAYOUT, THEME & PERFORMANCE (0..9)
                     0 => {
+                        this.open_modal(ActiveModal::Theme);
+                    }
+                    1 => {
                         this.config.layout_style = match this.config.layout_style {
                             LayoutStyle::Zenith => LayoutStyle::Classic,
                             LayoutStyle::Classic => LayoutStyle::Zenith,
@@ -3808,14 +3825,14 @@ impl AstryxTvApp {
                         this.save_config();
                         this.show_toast(format!("Switched to {}", this.config.layout_style.label()));
                     }
-                    1 => {
+                    2 => {
                         this.config.settings_view = match this.config.settings_view {
                             SettingsViewMode::Grid => SettingsViewMode::List,
                             SettingsViewMode::List => SettingsViewMode::Grid,
                         };
                         this.save_config();
                     }
-                    2 => {
+                    3 => {
                         this.config.icon_size = match this.config.icon_size {
                             IconSize::Compact => IconSize::Standard,
                             IconSize::Standard => IconSize::Large,
@@ -3823,39 +3840,35 @@ impl AstryxTvApp {
                         };
                         this.save_config();
                     }
-                    3 => {
+                    4 => {
+                        this.config.lightweight_mode = !this.config.lightweight_mode;
+                        let tol = if this.config.lightweight_mode { 0.6 } else { 0.2 };
+                        ctx.options_mut(|o| {
+                            o.tessellation_options.bezier_tolerance = tol;
+                        });
+                        this.wallpaper_tex = None;
+                        this.wallpaper_loading = None;
+                        this.save_config();
+                        this.ensure_wallpaper(ctx.clone());
+                        this.show_toast(if this.config.lightweight_mode {
+                            "Lightweight Mode ON (low CPU/VRAM for older TVs)"
+                        } else {
+                            "Full 4K Quality Mode ON"
+                        });
+                    }
+                    5 => {
                         this.config.show_header = !this.config.show_header;
                         this.save_config();
                     }
-                    4 => {
+                    6 => {
                         this.config.show_labels = !this.config.show_labels;
                         this.save_config();
                     }
-                    5 => {
+                    7 => {
                         this.config.auto_night_dim = !this.config.auto_night_dim;
                         this.save_config();
                     }
-                    // Category 2: WEATHER & AMBIENT (6..12)
-                    6 => {
-                        this.config.show_weather = !this.config.show_weather;
-                        this.save_config();
-                    }
-                    7 => {
-                        this.open_modal(ActiveModal::WeatherCity);
-                    }
                     8 => {
-                        this.config.clock_24h = !this.config.clock_24h;
-                        this.save_config();
-                    }
-                    9 => {
-                        this.config.show_status_pill = !this.config.show_status_pill;
-                        this.save_config();
-                    }
-                    10 => {
-                        this.config.show_now_playing = !this.config.show_now_playing;
-                        this.save_config();
-                    }
-                    11 => {
                         this.config.ambient_timeout_secs = match this.config.ambient_timeout_secs {
                             0 => 60,
                             60 => 180,
@@ -3864,56 +3877,79 @@ impl AstryxTvApp {
                         };
                         this.save_config();
                     }
-                    // Category 3: APPS & LIBRARY (12..18)
+                    // Category 2: WEATHER & HUD STATUS (9..15)
+                    9 => {
+                        this.config.show_weather = !this.config.show_weather;
+                        this.save_config();
+                    }
+                    10 => {
+                        this.open_modal(ActiveModal::WeatherCity);
+                    }
+                    11 => {
+                        this.config.clock_24h = !this.config.clock_24h;
+                        this.save_config();
+                    }
                     12 => {
+                        this.config.show_status_pill = !this.config.show_status_pill;
+                        this.save_config();
+                    }
+                    13 => {
+                        this.config.show_now_playing = !this.config.show_now_playing;
+                        this.save_config();
+                    }
+                    14 => {
+                        this.open_modal(ActiveModal::Overlay);
+                    }
+                    // Category 3: APPS & LIBRARY (15..21)
+                    15 => {
                         this.config.sort_order = match this.config.sort_order {
                             SortOrder::Alpha => SortOrder::Recent,
                             SortOrder::Recent => SortOrder::Alpha,
                         };
                         this.save_config();
                     }
-                    13 => {
+                    16 => {
                         this.active_folder_idx = None;
                         this.open_modal(ActiveModal::Folders);
                     }
-                    14 => {
+                    17 => {
                         this.config.show_mobile_apps = !this.config.show_mobile_apps;
                         this.save_config();
                     }
-                    15 => {
+                    18 => {
                         this.config.show_system_apps = !this.config.show_system_apps;
                         this.save_config();
                     }
-                    16 => {
+                    19 => {
                         this.config.hidden_apps.clear();
                         this.save_config();
                         this.show_toast("Restored all hidden apps");
                     }
-                    17 => {
+                    20 => {
                         this.config.auto_clear_ram_on_home = !this.config.auto_clear_ram_on_home;
                         this.save_config();
                     }
-                    // Category 4: SYSTEM, COMPANION & UPDATES (18..25)
-                    18 => {
+                    // Category 4: SYSTEM, STARTUP & UPDATES (21..28)
+                    21 => {
+                        this.open_modal(ActiveModal::StartupOptions);
+                    }
+                    22 => {
                         let ok = bridge::open_home_settings();
                         if !ok {
                             this.show_toast("Open Android Settings → Apps → Default Home");
                         }
                     }
-                    19 => {
-                        this.open_modal(ActiveModal::Overlay);
-                    }
-                    20 => {
+                    23 => {
                         this.open_modal(ActiveModal::PowerMenu);
                     }
-                    21 => {
+                    24 => {
                         this.local_ip = bridge::get_local_ip();
                         this.open_modal(ActiveModal::PhoneCompanion);
                     }
-                    22 => {
+                    25 => {
                         this.open_modal(ActiveModal::Backup);
                     }
-                    23 => {
+                    26 => {
                         this.open_modal(ActiveModal::Updater);
                         if matches!(
                             this.updater_state,
@@ -3922,7 +3958,7 @@ impl AstryxTvApp {
                             this.spawn_check_update(ctx.clone(), false);
                         }
                     }
-                    24 => {
+                    27 => {
                         this.open_modal(ActiveModal::Donate);
                     }
                     _ => {}
@@ -4052,12 +4088,24 @@ impl AstryxTvApp {
                         });
                         ui.add_space(10.0);
 
-                        // (label, value, is_on, icon_id) — grouped in exact multiples of 3!
+                        // (label, value, is_on, icon_id) — grouped cleanly into 4 categories with Theme & Glass merged in!
                         let rows: [(&str, String, bool, usize); SETTING_COUNT] = [
-                            // LAYOUT & DISPLAY (0..6)
+                            // LAYOUT, THEME & PERFORMANCE (0..9)
+                            (
+                                "Theme & Glass",
+                                this.config.astryx_theme.label().replace("Astryx ", ""),
+                                true,
+                                201,
+                            ),
                             ("Layout Style", this.config.layout_style.label().to_string(), true, 0),
                             ("Settings View", this.config.settings_view.label().to_string(), true, 201),
                             ("Icon Size", this.config.icon_size.label().to_string(), true, 1),
+                            (
+                                "Lightweight Mode",
+                                if this.config.lightweight_mode { "ON" } else { "OFF" }.to_string(),
+                                this.config.lightweight_mode,
+                                14,
+                            ),
                             (
                                 "Clock & Weather Header",
                                 if this.config.show_header { "ON" } else { "OFF" }.to_string(),
@@ -4076,7 +4124,18 @@ impl AstryxTvApp {
                                 this.config.auto_night_dim,
                                 8,
                             ),
-                            // WEATHER & AMBIENT (6..12)
+                            (
+                                "Ambient Clock",
+                                match this.config.ambient_timeout_secs {
+                                    0 => "OFF".to_string(),
+                                    60 => "1 min".to_string(),
+                                    180 => "3 min".to_string(),
+                                    _ => "5 min".to_string(),
+                                },
+                                this.config.ambient_timeout_secs > 0,
+                                8,
+                            ),
+                            // WEATHER & HUD STATUS (9..15)
                             (
                                 "Live Weather",
                                 if this.config.show_weather { "ON" } else { "OFF" }.to_string(),
@@ -4114,17 +4173,12 @@ impl AstryxTvApp {
                                 7,
                             ),
                             (
-                                "Ambient Clock",
-                                match this.config.ambient_timeout_secs {
-                                    0 => "OFF".to_string(),
-                                    60 => "1 min".to_string(),
-                                    180 => "3 min".to_string(),
-                                    _ => "5 min".to_string(),
-                                },
-                                this.config.ambient_timeout_secs > 0,
-                                8,
+                                "HUD Overlay",
+                                if this.config.show_fps_meter { "ON" } else { "OFF" }.to_string(),
+                                this.config.show_fps_meter,
+                                14,
                             ),
-                            // APPS & LIBRARY (12..18)
+                            // APPS & LIBRARY (15..21)
                             (
                                 "App Sort Order",
                                 match this.config.sort_order {
@@ -4164,7 +4218,13 @@ impl AstryxTvApp {
                                 this.config.auto_clear_ram_on_home,
                                 101,
                             ),
-                            // SYSTEM, COMPANION & UPDATES (18..25)
+                            // SYSTEM, STARTUP & UPDATES (21..28)
+                            (
+                                "Startup Options",
+                                this.config.startup_mode.label().to_string(),
+                                this.config.startup_mode != StartupMode::Home,
+                                100,
+                            ),
                             (
                                 "Default Home",
                                 if this.is_default_home {
@@ -4174,16 +4234,6 @@ impl AstryxTvApp {
                                 },
                                 this.is_default_home,
                                 11,
-                            ),
-                            (
-                                "HUD Overlay",
-                                if this.config.show_fps_meter {
-                                    "ON".to_string()
-                                } else {
-                                    "OFF".to_string()
-                                },
-                                this.config.show_fps_meter,
-                                14,
                             ),
                             (
                                 "Power & Devices",
@@ -4224,14 +4274,16 @@ impl AstryxTvApp {
                             ),
                         ];
 
-                        let is_submenu_item = |idx: usize| matches!(idx, 7 | 13 | 18 | 19 | 20 | 21 | 22 | 23 | 24);
+                        let is_submenu_item = |idx: usize| {
+                            matches!(idx, 0 | 10 | 14 | 16 | 21 | 22 | 23 | 24 | 25 | 26 | 27)
+                        };
 
                         let category_for = |idx: usize| -> Option<&'static str> {
                             match idx {
-                                0 => Some("LAYOUT & DISPLAY"),
-                                6 => Some("WEATHER & AMBIENT"),
-                                12 => Some("APPS & LIBRARY"),
-                                18 => Some("SYSTEM, COMPANION & UPDATES"),
+                                0 => Some("LAYOUT, THEME & PERFORMANCE"),
+                                9 => Some("WEATHER & HUD STATUS"),
+                                15 => Some("APPS & LIBRARY"),
+                                21 => Some("SYSTEM, STARTUP & UPDATES"),
                                 _ => None,
                             }
                         };
@@ -6452,6 +6504,205 @@ impl AstryxTvApp {
                     }
                 }
             }
+
+            ActiveModal::StartupOptions => {
+                const ROW_COUNT: usize = 4;
+                let mut trigger = false;
+                if allow_keys {
+                    ctx.input(|i| {
+                        if i.key_pressed(Key::ArrowDown) {
+                            self.modal_focus = (self.modal_focus + 1).min(ROW_COUNT - 1);
+                            self.modal_focus_changed = true;
+                        } else if i.key_pressed(Key::ArrowUp) {
+                            if self.modal_focus == 0 {
+                                self.modal_close_focused = true;
+                            } else {
+                                self.modal_focus -= 1;
+                                self.modal_focus_changed = true;
+                            }
+                        } else if i.key_pressed(Key::Enter)
+                            || i.key_pressed(Key::Space)
+                            || i.key_pressed(Key::ArrowLeft)
+                            || i.key_pressed(Key::ArrowRight)
+                        {
+                            trigger = true;
+                        }
+                    });
+                }
+
+                let app_name = if self.config.startup_app_pkg.is_empty() {
+                    "None selected".to_string()
+                } else {
+                    self.apps
+                        .iter()
+                        .find(|a| a.package_name == self.config.startup_app_pkg)
+                        .map(|a| self.display_label(a))
+                        .unwrap_or_else(|| self.config.startup_app_pkg.clone())
+                };
+
+                let mut apply_idx: Option<usize> = if trigger { Some(self.modal_focus) } else { None };
+
+                self.draw_modal_shell(
+                    ctx,
+                    "Startup Options  ·  Action when TV turns on",
+                    640.0,
+                    365.0,
+                    |this, ui, _ctx| {
+                        let accent = this.config.accent();
+                        ui.label(
+                            RichText::new(
+                                "Choose what Astryx opens automatically when your TV boots up. Press BACK during the startup countdown to stay on Home.",
+                            )
+                            .font(FontId::proportional(12.0))
+                            .color(Color32::from_rgb(185, 202, 226)),
+                        );
+                        ui.add_space(10.0);
+
+                        let rows: [(&str, &str, String, usize); ROW_COUNT] = [
+                            (
+                                "On TV Turn-On",
+                                "Stay on Home, launch a chosen app, resume last app, or open TV/HDMI input",
+                                this.config.startup_mode.label().to_string(),
+                                100,
+                            ),
+                            (
+                                "Chosen Startup App",
+                                "Press OK to cycle through installed apps",
+                                app_name.clone(),
+                                201,
+                            ),
+                            (
+                                "Startup Delay",
+                                "Grace period before auto-launching (press BACK to cancel)",
+                                if this.config.startup_delay_secs == 0 {
+                                    "Instant".to_string()
+                                } else {
+                                    format!("{}s", this.config.startup_delay_secs)
+                                },
+                                3,
+                            ),
+                            (
+                                "Test Startup Action Now",
+                                "Run your configured startup action immediately",
+                                "Run ›".to_string(),
+                                14,
+                            ),
+                        ];
+
+                        for (idx, (title, sub, val, ic)) in rows.iter().enumerate() {
+                            let focused = this.modal_focus == idx;
+                            let resp = egui::Frame::NONE
+                                .fill(if focused {
+                                    Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 48)
+                                } else {
+                                    Color32::from_rgba_unmultiplied(255, 255, 255, 10)
+                                })
+                                .stroke(if focused {
+                                    Stroke::new(1.8_f32, accent)
+                                } else {
+                                    Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(255, 255, 255, 18))
+                                })
+                                .corner_radius(CornerRadius::same(12))
+                                .inner_margin(egui::Margin::symmetric(14, 8))
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        let (ir, _) = ui.allocate_exact_size(Vec2::splat(26.0), Sense::hover());
+                                        let sc = Self::setting_icon_color(*ic);
+                                        ui.painter().circle_filled(
+                                            ir.center(),
+                                            12.5,
+                                            if focused {
+                                                Color32::from_rgba_unmultiplied(255, 255, 255, 32)
+                                            } else {
+                                                Color32::from_rgba_unmultiplied(255, 255, 255, 16)
+                                            },
+                                        );
+                                        Self::draw_setting_icon(ui.painter(), ir.center(), *ic, sc);
+                                        ui.add_space(6.0);
+                                        ui.vertical(|ui| {
+                                            ui.label(RichText::new(*title).font(FontId::proportional(13.5)).strong().color(Color32::WHITE));
+                                            ui.label(RichText::new(*sub).font(FontId::proportional(10.5)).color(Color32::from_rgb(172, 188, 214)));
+                                        });
+                                        ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                                            egui::Frame::NONE
+                                                .fill(Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), if focused { 95 } else { 38 }))
+                                                .corner_radius(CornerRadius::same(8))
+                                                .inner_margin(egui::Margin::symmetric(10, 4))
+                                                .show(ui, |ui| {
+                                                    ui.label(RichText::new(val).font(FontId::proportional(11.5)).strong().color(Color32::WHITE));
+                                                });
+                                        });
+                                    });
+                                })
+                                .response;
+                            if resp.clicked() {
+                                this.modal_focus = idx;
+                                apply_idx = Some(idx);
+                            }
+                            ui.add_space(6.0);
+                        }
+                    },
+                );
+
+                if let Some(idx) = apply_idx {
+                    match idx {
+                        0 => {
+                            self.config.startup_mode = self.config.startup_mode.next();
+                            self.save_config();
+                        }
+                        1 => {
+                            if !visible.is_empty() {
+                                let cur = visible
+                                    .iter()
+                                    .position(|a| a.package_name == self.config.startup_app_pkg);
+                                let next_pkg = match cur {
+                                    None => visible[0].package_name.clone(),
+                                    Some(i) if i + 1 < visible.len() => {
+                                        visible[i + 1].package_name.clone()
+                                    }
+                                    _ => String::new(),
+                                };
+                                self.config.startup_app_pkg = next_pkg;
+                                self.save_config();
+                            }
+                        }
+                        2 => {
+                            self.config.startup_delay_secs = match self.config.startup_delay_secs {
+                                0 => 2,
+                                2 => 5,
+                                _ => 0,
+                            };
+                            self.save_config();
+                        }
+                        3 => match self.config.startup_mode {
+                            StartupMode::Home => self.show_toast("Startup action is set to Stay on Home"),
+                            StartupMode::LaunchApp => {
+                                let pkg = self.config.startup_app_pkg.clone();
+                                if pkg.is_empty() {
+                                    self.show_toast("Pick a Chosen Startup App first");
+                                } else {
+                                    self.modal = ActiveModal::None;
+                                    self.modal_stack.clear();
+                                    self.launch_app(&pkg);
+                                }
+                            }
+                            StartupMode::LastUsedApp => {
+                                if let Some(pkg) = self.config.recents.first().cloned() {
+                                    self.modal = ActiveModal::None;
+                                    self.modal_stack.clear();
+                                    self.launch_app(&pkg);
+                                } else {
+                                    self.show_toast("No recently used app yet");
+                                }
+                            }
+                            StartupMode::HdmiInput => {
+                                bridge::open_tv_inputs();
+                            }
+                        },
+                        _ => {}
+                    }
+                }
+            }
         }
     }
     fn draw_zenith_home(&mut self, ctx: &egui::Context, visible: &[TvAppInfo]) {
@@ -6929,6 +7180,39 @@ impl eframe::App for AstryxTvApp {
         self.update_clock_cache();
         let screen = ctx.screen_rect();
         self.draw_background(ctx, screen);
+
+        // Execute configured Startup Option (chosen app / last app / TV HDMI input) with cancel-on-BACK
+        if self.startup_pending {
+            let cancel = bridge::take_back_pressed()
+                || ctx.input(|i| i.key_pressed(Key::Escape) || i.key_pressed(Key::Backspace));
+            if cancel {
+                self.startup_pending = false;
+                self.show_toast("Startup auto-launch cancelled");
+            } else if self.startup_started_at.elapsed()
+                >= Duration::from_secs(self.config.startup_delay_secs as u64)
+            {
+                self.startup_pending = false;
+                match self.config.startup_mode {
+                    StartupMode::Home => {}
+                    StartupMode::LaunchApp => {
+                        let pkg = self.config.startup_app_pkg.clone();
+                        if !pkg.is_empty() {
+                            self.launch_app(&pkg);
+                        }
+                    }
+                    StartupMode::LastUsedApp => {
+                        if let Some(pkg) = self.config.recents.first().cloned() {
+                            self.launch_app(&pkg);
+                        }
+                    }
+                    StartupMode::HdmiInput => {
+                        bridge::open_tv_inputs();
+                    }
+                }
+            } else {
+                ctx.request_repaint_after(Duration::from_millis(200));
+            }
+        }
 
         // Track user input for Ambient Clock Screensaver auto-idle
         let had_input = ctx.input(|i| {

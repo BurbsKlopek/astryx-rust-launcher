@@ -332,6 +332,7 @@ pub fn fetch_wallpaper_image(
     scene: WeatherScene,
     blur_level: u8,
     custom_path: &str,
+    lightweight: bool,
 ) -> Option<ColorImage> {
     if scene.is_procedural_shader() {
         return None;
@@ -372,9 +373,15 @@ pub fn fetch_wallpaper_image(
     };
 
     let mut img = image::load_from_memory(&bytes).ok()?;
-    // Supersample 4K/QHD source cleanly with CatmullRom to crisp native 1920x1080 (zero JPEG artifacts!)
-    if img.width() > 1920 || img.height() > 1080 {
-        img = img.resize(1920, 1080, image::imageops::FilterType::CatmullRom);
+    let (max_w, max_h, filt) = if lightweight {
+        // Lightweight mode for older TVs / 1GB streaming sticks: ~60% lower VRAM & faster decode
+        (1280, 720, image::imageops::FilterType::Triangle)
+    } else {
+        // Supersample 4K/QHD source cleanly with CatmullRom to crisp native 1920x1080
+        (1920, 1080, image::imageops::FilterType::CatmullRom)
+    };
+    if img.width() > max_w || img.height() > max_h {
+        img = img.resize(max_w, max_h, filt);
     }
     if blur_level > 0 {
         let w = img.width();

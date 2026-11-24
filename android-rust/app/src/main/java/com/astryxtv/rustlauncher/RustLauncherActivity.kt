@@ -469,6 +469,26 @@ class RustLauncherActivity : NativeActivity() {
         }
     }
 
+    fun rustOpenTvInputs(): Boolean {
+        val candidates = listOf(
+            Intent("com.android.tv.action.OPEN_INPUTS"),
+            Intent(Intent.ACTION_VIEW, Uri.parse("content://android.media.tv/channel")),
+            Intent(Intent.ACTION_VIEW, Uri.parse("content://android.media.tv/passthrough")),
+            Intent(Settings.ACTION_DISPLAY_SETTINGS)
+        )
+        for (i in candidates) {
+            try {
+                i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                if (i.resolveActivity(packageManager) != null) {
+                    startActivity(i)
+                    return true
+                }
+            } catch (_: Throwable) {
+            }
+        }
+        return false
+    }
+
     fun rustExportBackup(json: String): String {
         return try {
             val dir = getExternalFilesDir(null) ?: filesDir
