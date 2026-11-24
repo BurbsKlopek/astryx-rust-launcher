@@ -1773,6 +1773,46 @@ impl AstryxTvApp {
         }
     }
 
+    fn setting_icon_color(kind: usize) -> Color32 {
+        match kind {
+            0 => Color32::from_rgb(56, 189, 248),   // Layout: Sky Cyan
+            1 => Color32::from_rgb(168, 85, 247),   // Icon Size: Violet
+            2 => Color32::from_rgb(129, 140, 248),  // Sort: Indigo
+            3 | 6 => Color32::from_rgb(96, 165, 250), // Clock: Electric Blue
+            4 => Color32::from_rgb(251, 191, 36),   // Weather / City: Sun Gold
+            5 => Color32::from_rgb(244, 114, 182),  // Labels: Rose Pink
+            7 => Color32::from_rgb(52, 211, 153),   // Status / Now Playing: Emerald
+            8 => Color32::from_rgb(192, 132, 252),  // Night Dim / Ambient: Lavender
+            9 => Color32::from_rgb(45, 212, 191),   // Mobile Apps: Teal
+            10 => Color32::from_rgb(148, 163, 184), // System Apps: Cool Silver
+            11 => Color32::from_rgb(74, 222, 128),  // Default Home: Mint Green
+            12 => Color32::from_rgb(251, 113, 133), // Hidden Apps: Coral
+            13 => Color32::from_rgb(56, 189, 248),  // App Updates: Bright Sky
+            14 => Color32::from_rgb(52, 211, 153),  // HUD Overlay: Neon Emerald
+            15 => Color32::from_rgb(255, 221, 0),   // Buy Me a Coffee: Coffee Gold
+            100 | 202 => Color32::from_rgb(251, 146, 60), // Power / Display / GPU: Amber Orange
+            101 => Color32::from_rgb(34, 211, 238), // RAM / CPU: Cyan
+            102 => Color32::from_rgb(52, 211, 153), // Backup / Storage: Emerald
+            200 => Color32::from_rgb(56, 189, 248), // Phone Companion / Network: Sky Blue
+            201 => Color32::from_rgb(192, 132, 252), // Folders / Settings View: Purple
+            _ => Color32::from_rgb(125, 211, 252),
+        }
+    }
+
+    fn theme_icon_color(idx: usize, accent: Color32) -> Color32 {
+        match idx {
+            0 => Color32::from_rgb(168, 85, 247),  // Astryx Theme: Violet
+            1 => Color32::from_rgb(251, 191, 36),  // Live Wallpaper: Sun Gold
+            2 => accent,                           // Accent Color: Active Accent
+            3 => Color32::from_rgb(34, 211, 238),  // Focus Animation: Electric Cyan
+            4 => Color32::from_rgb(244, 114, 182), // Modal Pop-In: Rose Pink
+            5 => Color32::from_rgb(56, 189, 248),  // Live Sky Motion: Sky Blue
+            6 => Color32::from_rgb(45, 212, 191),  // Menu Transparency: Teal
+            7 => Color32::from_rgb(129, 140, 248), // Glass Opacity: Indigo
+            _ => Color32::from_rgb(192, 132, 252), // Backdrop Blur: Lavender
+        }
+    }
+
     fn draw_setting_icon(p: &egui::Painter, c: Pos2, kind: usize, color: Color32) {
         let s = Stroke::new(1.5_f32, color);
         match kind {
@@ -3498,22 +3538,32 @@ impl AstryxTvApp {
                                             egui::StrokeKind::Inside,
                                         );
 
-                                        // Top-left circular vector icon badge
+                                        // Top-left circular color-coded vector icon badge
                                         let ic_c = Pos2::new(rect.left() + 26.0, rect.top() + 26.0);
+                                        let tc = Self::theme_icon_color(idx, accent);
                                         p.circle_filled(
                                             ic_c,
                                             13.5,
-                                            if focused {
-                                                Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 85)
-                                            } else {
-                                                Color32::from_rgba_unmultiplied(255, 255, 255, 18)
-                                            },
+                                            Color32::from_rgba_unmultiplied(
+                                                tc.r(),
+                                                tc.g(),
+                                                tc.b(),
+                                                if focused { 115 } else { 48 },
+                                            ),
+                                        );
+                                        p.circle_stroke(
+                                            ic_c,
+                                            13.5,
+                                            Stroke::new(
+                                                1.0_f32,
+                                                Color32::from_rgba_unmultiplied(tc.r(), tc.g(), tc.b(), 110),
+                                            ),
                                         );
                                         Self::draw_theme_icon(
                                             p,
                                             ic_c,
                                             idx,
-                                            if focused { Color32::WHITE } else { Color32::from_rgb(205, 220, 242) },
+                                            if focused { Color32::WHITE } else { tc },
                                             accent,
                                         );
 
@@ -3610,24 +3660,22 @@ impl AstryxTvApp {
                                         }
                                         let (ic_r, _) =
                                             ui.allocate_exact_size(Vec2::splat(24.0), Sense::hover());
+                                        let tc = Self::theme_icon_color(idx, accent);
                                         ui.painter().circle_filled(
                                             ic_r.center(),
                                             11.5,
-                                            if focused {
-                                                Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 65)
-                                            } else {
-                                                Color32::from_rgba_unmultiplied(255, 255, 255, 16)
-                                            },
+                                            Color32::from_rgba_unmultiplied(
+                                                tc.r(),
+                                                tc.g(),
+                                                tc.b(),
+                                                if focused { 105 } else { 46 },
+                                            ),
                                         );
                                         Self::draw_theme_icon(
                                             ui.painter(),
                                             ic_r.center(),
                                             idx,
-                                            if focused {
-                                                Color32::WHITE
-                                            } else {
-                                                Color32::from_rgb(205, 218, 240)
-                                            },
+                                            if focused { Color32::WHITE } else { tc },
                                             accent,
                                         );
                                         ui.add_space(4.0);
@@ -4290,22 +4338,32 @@ impl AstryxTvApp {
                                             egui::StrokeKind::Inside,
                                         );
 
-                                        // Top-left circular icon badge
+                                        // Top-left circular color-coded icon badge
                                         let ic_c = Pos2::new(rect.left() + 22.0, rect.top() + 20.0);
+                                        let sc = Self::setting_icon_color(*icon_id);
                                         p.circle_filled(
                                             ic_c,
-                                            11.5,
-                                            if focused {
-                                                Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 85)
-                                            } else {
-                                                Color32::from_rgba_unmultiplied(255, 255, 255, 18)
-                                            },
+                                            12.0,
+                                            Color32::from_rgba_unmultiplied(
+                                                sc.r(),
+                                                sc.g(),
+                                                sc.b(),
+                                                if focused { 115 } else { 48 },
+                                            ),
+                                        );
+                                        p.circle_stroke(
+                                            ic_c,
+                                            12.0,
+                                            Stroke::new(
+                                                1.0_f32,
+                                                Color32::from_rgba_unmultiplied(sc.r(), sc.g(), sc.b(), 105),
+                                            ),
                                         );
                                         Self::draw_setting_icon(
                                             p,
                                             ic_c,
                                             *icon_id,
-                                            if focused { Color32::WHITE } else { Color32::from_rgb(205, 220, 242) },
+                                            if focused { Color32::WHITE } else { sc },
                                         );
 
                                         // Top-right status pill badge
@@ -4420,24 +4478,22 @@ impl AstryxTvApp {
                                                 );
                                             }
                                             let (ic_r, _) = ui.allocate_exact_size(Vec2::splat(24.0), Sense::hover());
+                                            let sc = Self::setting_icon_color(*icon_id);
                                             ui.painter().circle_filled(
                                                 ic_r.center(),
                                                 11.5,
-                                                if focused {
-                                                    Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 65)
-                                                } else {
-                                                    Color32::from_rgba_unmultiplied(255, 255, 255, 16)
-                                                },
+                                                Color32::from_rgba_unmultiplied(
+                                                    sc.r(),
+                                                    sc.g(),
+                                                    sc.b(),
+                                                    if focused { 105 } else { 46 },
+                                                ),
                                             );
                                             Self::draw_setting_icon(
                                                 ui.painter(),
                                                 ic_r.center(),
                                                 *icon_id,
-                                                if focused {
-                                                    Color32::WHITE
-                                                } else {
-                                                    Color32::from_rgb(205, 218, 240)
-                                                },
+                                                if focused { Color32::WHITE } else { sc },
                                             );
                                             ui.add_space(4.0);
                                             ui.label(
@@ -5640,29 +5696,22 @@ impl AstryxTvApp {
                                             Vec2::splat(26.0),
                                             Sense::hover(),
                                         );
+                                        let sc = Self::setting_icon_color(*icon_id);
                                         ui.painter().circle_filled(
                                             ir.center(),
                                             12.5,
-                                            if focused {
-                                                Color32::from_rgba_unmultiplied(
-                                                    accent.r(),
-                                                    accent.g(),
-                                                    accent.b(),
-                                                    78,
-                                                )
-                                            } else {
-                                                Color32::from_rgba_unmultiplied(255, 255, 255, 18)
-                                            },
+                                            Color32::from_rgba_unmultiplied(
+                                                sc.r(),
+                                                sc.g(),
+                                                sc.b(),
+                                                if focused { 105 } else { 46 },
+                                            ),
                                         );
                                         Self::draw_setting_icon(
                                             ui.painter(),
                                             ir.center(),
                                             *icon_id,
-                                            if focused {
-                                                Color32::WHITE
-                                            } else {
-                                                Color32::from_rgb(205, 220, 242)
-                                            },
+                                            if focused { Color32::WHITE } else { sc },
                                         );
                                         ui.add_space(6.0);
                                         ui.vertical(|ui| {
@@ -6244,7 +6293,13 @@ impl AstryxTvApp {
                                     ui.set_min_width(ui.available_width());
                                     ui.horizontal(|ui| {
                                         let (ir, _) = ui.allocate_exact_size(Vec2::splat(26.0), Sense::hover());
-                                        Self::draw_setting_icon(ui.painter(), ir.center(), *ic, Color32::WHITE);
+                                        let sc = Self::setting_icon_color(*ic);
+                                        ui.painter().circle_filled(
+                                            ir.center(),
+                                            12.5,
+                                            Color32::from_rgba_unmultiplied(sc.r(), sc.g(), sc.b(), if focused { 105 } else { 46 }),
+                                        );
+                                        Self::draw_setting_icon(ui.painter(), ir.center(), *ic, if focused { Color32::WHITE } else { sc });
                                         ui.add_space(6.0);
                                         ui.vertical(|ui| {
                                             ui.label(RichText::new(*title).font(FontId::proportional(14.0)).strong().color(Color32::WHITE));
