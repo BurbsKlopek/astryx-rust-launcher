@@ -45,10 +45,14 @@ pub enum WeatherScene {
     Snow,
     LiveUkSat,
     LiveEarth,
+    AuroraBorealis,
+    LiquidMesh,
+    DeepSpace,
+    CustomLocal,
 }
 
 impl WeatherScene {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 15] = [
         Self::Auto,
         Self::ClearDay,
         Self::Golden,
@@ -60,6 +64,10 @@ impl WeatherScene {
         Self::Snow,
         Self::LiveUkSat,
         Self::LiveEarth,
+        Self::AuroraBorealis,
+        Self::LiquidMesh,
+        Self::DeepSpace,
+        Self::CustomLocal,
     ];
 
     pub fn label(self) -> &'static str {
@@ -75,9 +83,33 @@ impl WeatherScene {
             Self::Snow => "Snow",
             Self::LiveUkSat => "Live UK Sat",
             Self::LiveEarth => "Live Earth",
+            Self::AuroraBorealis => "Aurora Shader",
+            Self::LiquidMesh => "Liquid Mesh",
+            Self::DeepSpace => "Deep Space",
+            Self::CustomLocal => "Custom 4K Photo",
         }
     }
+
+    pub fn is_procedural_shader(self) -> bool {
+        matches!(self, Self::AuroraBorealis | Self::LiquidMesh | Self::DeepSpace)
+    }
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppFolder {
+    pub name: String,
+    pub packages: Vec<String>,
+}
+
+pub const WEATHER_CITY_PRESETS: [(&str, f64, f64); 7] = [
+    ("London · UK", 51.5074, -0.1278),
+    ("Birmingham · UK", 52.4862, -1.8904),
+    ("Manchester · UK", 53.4808, -2.2426),
+    ("Edinburgh · UK", 55.9533, -3.1883),
+    ("Bristol · UK", 51.4545, -2.5879),
+    ("New York · US", 40.7128, -74.0060),
+    ("Tokyo · JP", 35.6762, 139.6503),
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IconSize {
@@ -176,6 +208,22 @@ fn default_true() -> bool {
     true
 }
 
+fn default_city() -> String {
+    "London · UK".to_string()
+}
+
+fn default_lat() -> f64 {
+    51.5074
+}
+
+fn default_lon() -> f64 {
+    -0.1278
+}
+
+fn default_ambient() -> u32 {
+    180
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LauncherConfig {
     pub astryx_theme: AstryxThemeId,
@@ -215,6 +263,24 @@ pub struct LauncherConfig {
     pub overlay_show_cpu: bool,
     #[serde(default = "default_true")]
     pub overlay_show_gpu: bool,
+    #[serde(default = "default_city")]
+    pub weather_city: String,
+    #[serde(default = "default_lat")]
+    pub weather_lat: f64,
+    #[serde(default = "default_lon")]
+    pub weather_lon: f64,
+    #[serde(default = "default_ambient")]
+    pub ambient_timeout_secs: u32,
+    #[serde(default)]
+    pub auto_clear_ram_on_home: bool,
+    #[serde(default = "default_true")]
+    pub show_now_playing: bool,
+    #[serde(default = "default_true")]
+    pub web_companion_enabled: bool,
+    #[serde(default)]
+    pub custom_wallpaper_path: String,
+    #[serde(default)]
+    pub app_folders: Vec<AppFolder>,
     pub icon_size: IconSize,
     pub sort_order: SortOrder,
     pub show_header: bool,
@@ -256,6 +322,15 @@ impl Default for LauncherConfig {
             overlay_show_ram: false,
             overlay_show_cpu: true,
             overlay_show_gpu: true,
+            weather_city: default_city(),
+            weather_lat: default_lat(),
+            weather_lon: default_lon(),
+            ambient_timeout_secs: default_ambient(),
+            auto_clear_ram_on_home: false,
+            show_now_playing: true,
+            web_companion_enabled: true,
+            custom_wallpaper_path: String::new(),
+            app_folders: Vec::new(),
             icon_size: IconSize::Standard,
             sort_order: SortOrder::Alpha,
             show_header: true,

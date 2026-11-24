@@ -9,8 +9,11 @@ import android.content.Intent
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageInstaller
 import android.content.pm.PackageManager
+import android.media.AudioManager
 import java.io.File
 import java.io.FileInputStream
+import java.net.Inet4Address
+import java.net.NetworkInterface
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.drawable.BitmapDrawable
@@ -396,6 +399,8 @@ class RustLauncherActivity : NativeActivity() {
             "network" -> Settings.ACTION_WIFI_SETTINGS
             "apps" -> Settings.ACTION_APPLICATION_SETTINGS
             "display" -> Settings.ACTION_DISPLAY_SETTINGS
+            "bluetooth" -> Settings.ACTION_BLUETOOTH_SETTINGS
+            "dream" -> Settings.ACTION_DREAM_SETTINGS
             else -> Settings.ACTION_SETTINGS
         }
         try {
@@ -405,6 +410,83 @@ class RustLauncherActivity : NativeActivity() {
                 startActivity(Intent(Settings.ACTION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
             } catch (_: Throwable) {
             }
+        }
+    }
+
+    fun rustGetLocalIp(): String {
+        return try {
+            val ifaces = NetworkInterface.getNetworkInterfaces()
+            while (ifaces != null && ifaces.hasMoreElements()) {
+                val iface = ifaces.nextElement()
+                if (!iface.isUp || iface.isLoopback) continue
+                val name = iface.name.lowercase()
+                if (name.contains("tun") || name.contains("ppp") || name.contains("nord")) continue
+                val addrs = iface.inetAddresses
+                while (addrs.hasMoreElements()) {
+                    val addr = addrs.nextElement()
+                    if (!addr.isLoopbackAddress && addr is Inet4Address) {
+                        val ip = addr.hostAddress ?: continue
+                        if (ip.startsWith("192.168.") || ip.startsWith("10.") || ip.startsWith("172.")) {
+                            return ip
+                        }
+                    }
+                }
+            }
+            "127.0.0.1"
+        } catch (_: Throwable) {
+            "127.0.0.1"
+        }
+    }
+
+    fun rustIsMusicActive(): Boolean {
+        return try {
+            val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            am.isMusicActive
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    fun rustMediaPlayPause() {
+        try {
+            val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            val now = android.os.SystemClock.uptimeMillis()
+            am.dispatchMediaKeyEvent(KeyEvent(now, now, KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE, 0))
+            am.dispatchMediaKeyEvent(KeyEvent(now, now, KeyEvent.ACTION_UP, KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE, 0))
+        } catch (_: Throwable) {
+        }
+    }
+
+    fun rustTriggerSleep() {
+        try {
+            val dream = Intent(Intent.ACTION_MAIN).apply {
+                setClassName("com.android.systemui", "com.android.systemui.Somnambulator")
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            startActivity(dream)
+        } catch (_: Throwable) {
+            rustOpenSystemSettings("dream")
+        }
+    }
+
+    fun rustExportBackup(json: String): String {
+        return try {
+            val dir = getExternalFilesDir(null) ?: filesDir
+            val f = File(dir, "astryx_launcher_backup.json")
+            f.writeText(json)
+            f.absolutePath
+        } catch (t: Throwable) {
+            "ERR:${t.message ?: "export failed"}"
+        }
+    }
+
+    fun rustImportBackup(): String {
+        return try {
+            val dir = getExternalFilesDir(null) ?: filesDir
+            val f = File(dir, "astryx_launcher_backup.json")
+            if (f.exists()) f.readText() else ""
+        } catch (_: Throwable) {
+            ""
         }
     }
 

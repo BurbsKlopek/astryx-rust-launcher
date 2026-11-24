@@ -356,6 +356,76 @@ pub fn set_fps_overlay(enabled: bool, flags: i32) -> String {
     .unwrap_or_else(|| "ERR:JNI".to_string())
 }
 
+pub fn get_local_ip() -> String {
+    with_activity(|env, act| {
+        let val = env
+            .call_method(act, "rustGetLocalIp", "()Ljava/lang/String;", &[])
+            .ok()?
+            .l()
+            .ok()?;
+        let s: String = env.get_string(&JString::from(val)).ok()?.into();
+        Some(s)
+    })
+    .filter(|s| !s.is_empty())
+    .unwrap_or_else(|| "127.0.0.1".to_string())
+}
+
+pub fn is_music_active() -> bool {
+    with_activity(|env, act| {
+        env.call_method(act, "rustIsMusicActive", "()Z", &[])
+            .ok()?
+            .z()
+            .ok()
+    })
+    .unwrap_or(false)
+}
+
+pub fn media_play_pause() {
+    let _ = with_activity(|env, act| {
+        env.call_method(act, "rustMediaPlayPause", "()V", &[]).ok()?;
+        Some(())
+    });
+}
+
+pub fn trigger_sleep() {
+    let _ = with_activity(|env, act| {
+        env.call_method(act, "rustTriggerSleep", "()V", &[]).ok()?;
+        Some(())
+    });
+}
+
+pub fn export_backup(json: &str) -> String {
+    with_activity(|env, act| {
+        let j = env.new_string(json).ok()?;
+        let val = env
+            .call_method(
+                act,
+                "rustExportBackup",
+                "(Ljava/lang/String;)Ljava/lang/String;",
+                &[JValue::Object(&j)],
+            )
+            .ok()?
+            .l()
+            .ok()?;
+        let s: String = env.get_string(&JString::from(val)).ok()?.into();
+        Some(s)
+    })
+    .unwrap_or_else(|| "ERR:JNI".to_string())
+}
+
+pub fn import_backup() -> String {
+    with_activity(|env, act| {
+        let val = env
+            .call_method(act, "rustImportBackup", "()Ljava/lang/String;", &[])
+            .ok()?
+            .l()
+            .ok()?;
+        let s: String = env.get_string(&JString::from(val)).ok()?.into();
+        Some(s)
+    })
+    .unwrap_or_default()
+}
+
 pub fn get_cache_dir() -> String {
     with_activity(|env, act| {
         let val = env

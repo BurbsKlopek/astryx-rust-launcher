@@ -1,11 +1,12 @@
 use crate::a2ui::{A2uiEngine, SAMPLE_A2UI_PAYLOAD};
 use crate::bridge::{self, TvAppInfo, TvSystemStatus};
 use crate::theme::{
-    AstryxThemeId, FocusAnimStyle, IconSize, LauncherConfig, LayoutStyle, SettingsViewMode,
-    SortOrder, WeatherScene, ACCENT_PRESETS,
+    AppFolder, AstryxThemeId, FocusAnimStyle, IconSize, LauncherConfig, LayoutStyle,
+    SettingsViewMode, SortOrder, WeatherScene, ACCENT_PRESETS, WEATHER_CITY_PRESETS,
 };
 use crate::updater::{self, ReleaseInfo, UpdateCheckOutcome};
 use crate::weather::{self, WeatherData};
+use crate::web_server::{self, WebCmd, WEB_COMPANION_PORT};
 use chrono::{Local, Timelike};
 use egui::{
     Align, Align2, Color32, ColorImage, CornerRadius, FontId, Key, Pos2, Rect, RichText,
@@ -13,7 +14,7 @@ use egui::{
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const PREF_CONFIG_KEY: &str = "astryx_rust_config_v1";
@@ -22,8 +23,9 @@ const DONATE_URL: &str = "https://buymeacoffee.com/burbsklopek";
 enum BgMsg {
     AppsLoaded(Vec<TvAppInfo>),
     IconLoaded(String, ColorImage),
-    StatusLoaded(TvSystemStatus, bool),
+    StatusLoaded(TvSystemStatus, bool, bool), // (status, is_home, is_music_active)
     WeatherLoaded(WeatherData),
+    CityGeocoded(String, f64, f64),
     WallpaperLoaded(WeatherScene, u8, ColorImage),
     RamCleared(i32, i32), // (before_mb, after_mb)
     UpdateChecked(UpdateCheckOutcome, bool), // (outcome, silent)
@@ -72,6 +74,11 @@ enum ActiveModal {
     Updater,
     Overlay,
     Donate,
+    WeatherCity,
+    Folders,
+    PowerMenu,
+    PhoneCompanion,
+    Backup,
     Search,
     A2ui,
     AppContext(String), // package_name
@@ -89,6 +96,8 @@ pub struct AstryxTvApp {
     cached_date_short: String,
     status: TvSystemStatus,
     is_default_home: bool,
+    is_music_active: bool,
+    local_ip: String,
     weather: Option<WeatherData>,
     use_fahrenheit: bool,
 
@@ -137,6 +146,11 @@ pub struct AstryxTvApp {
     // Async messaging & timers
     tx: Sender<BgMsg>,
     rx: Receiver<BgMsg>,
+    web_rx: Receiver<WebCmd>,
+    config_snapshot: Arc<Mutex<String>>,
+    last_input_at: Instant,
+    ambient_active: bool,
+    active_folder_idx: Option<usize>,
     start_time: Instant,
     last_status_poll: Instant,
     last_weather_poll: Instant,
@@ -193,8 +207,12 @@ impl AstryxTvApp {
         };
 
         let (tx, rx) = mpsc::channel();
+        let (web_tx, web_rx) = mpsc::channel();
         let now = Instant::now();
-
+        let config_json = serde_json::to_string_pretty(&config).unwrap_or_else(|_| "{}".to_string());
+        let config_snapshot = Arc::new(Mutex::new(config_json));
+        let local_ip = bridge::get_local_ip();
+        let web_enabled = config.web_companion_enabled;
         let show_welcome = !config.onboarding_done;
 
         let mut app = Self {
@@ -208,6 +226,8 @@ impl AstryxTvApp {
             cached_date_short: String::new(),
             status: TvSystemStatus::default(),
             is_default_home: false,
+            is_music_active: false,
+            local_ip,
             weather: None,
             use_fahrenheit: false,
             icon_textures: HashMap::new(),
@@ -250,11 +270,28 @@ impl AstryxTvApp {
             toast: None,
             tx,
             rx,
+            web_rx,
+            config_snapshot: config_snapshot.clone(),
+            last_input_at: now,
+            ambient_active: false,
+            active_folder_idx: None,
             start_time: now,
             last_status_poll: now - Duration::from_secs(60),
             last_weather_poll: now - Duration::from_secs(900),
             last_grid_cols: 6,
         };
+
+        if web_enabled {
+            web_server::spawn(
+                web_tx,
+                cc.egui_ctx.clone(),
+                bridge::get_cache_dir(),
+                config_snapshot,
+            );
+        }
+        if app.config.auto_clear_ram_on_home {
+            app.spawn_clear_ram(cc.egui_ctx.clone());
+        }
 
         app.spawn_load_apps(cc.egui_ctx.clone());
         app.spawn_load_status(cc.egui_ctx.clone());
@@ -273,6 +310,11 @@ impl AstryxTvApp {
         if let Ok(json) = serde_json::to_string(&self.config) {
             bridge::set_pref(PREF_CONFIG_KEY, &json);
         }
+        if let Ok(pretty) = serde_json::to_string_pretty(&self.config) {
+            if let Ok(mut g) = self.config_snapshot.lock() {
+                *g = pretty;
+            }
+        }
     }
 
     fn update_clock_cache(&mut self) {
@@ -285,7 +327,7 @@ impl AstryxTvApp {
             } else {
                 now.format("%I:%M:%S %p").to_string()
             };
-            self.cached_date_str = format!("{}  •  London · UK", now.format("%A, %d %B %Y"));
+            self.cached_date_str = format!("{}  •  {}", now.format("%A, %d %B %Y"), self.config.weather_city);
             self.cached_date_short = now.format("%a %d %b").to_string();
         }
     }
@@ -414,7 +456,8 @@ impl AstryxTvApp {
         std::thread::spawn(move || {
             let status = bridge::get_system_status();
             let is_home = bridge::is_default_home();
-            let _ = tx.send(BgMsg::StatusLoaded(status, is_home));
+            let music = bridge::is_music_active();
+            let _ = tx.send(BgMsg::StatusLoaded(status, is_home, music));
             ctx.request_repaint();
         });
     }
@@ -501,9 +544,11 @@ impl AstryxTvApp {
 
     fn spawn_load_weather(&mut self, ctx: egui::Context) {
         self.last_weather_poll = Instant::now();
+        let lat = self.config.weather_lat;
+        let lon = self.config.weather_lon;
         let tx = self.tx.clone();
         std::thread::spawn(move || {
-            if let Some(w) = weather::fetch_london_weather() {
+            if let Some(w) = weather::fetch_weather_for(lat, lon) {
                 let _ = tx.send(BgMsg::WeatherLoaded(w));
                 ctx.request_repaint();
             }
@@ -512,6 +557,11 @@ impl AstryxTvApp {
 
     fn ensure_wallpaper(&mut self, ctx: egui::Context) {
         let scene = self.active_scene();
+        if scene.is_procedural_shader() {
+            self.wallpaper_tex = None;
+            self.wallpaper_loading = None;
+            return;
+        }
         let blur = self.config.bg_blur;
         if let Some((loaded_scene, loaded_blur, _)) = &self.wallpaper_tex {
             if *loaded_scene == scene && *loaded_blur == blur {
@@ -522,9 +572,10 @@ impl AstryxTvApp {
             return;
         }
         self.wallpaper_loading = Some((scene, blur));
+        let custom_path = self.config.custom_wallpaper_path.clone();
         let tx = self.tx.clone();
         std::thread::spawn(move || {
-            if let Some(img) = weather::fetch_wallpaper_image(scene, blur) {
+            if let Some(img) = weather::fetch_wallpaper_image(scene, blur, &custom_path) {
                 let _ = tx.send(BgMsg::WallpaperLoaded(scene, blur, img));
                 ctx.request_repaint();
             }
@@ -588,13 +639,22 @@ impl AstryxTvApp {
                     );
                     self.icon_textures.insert(pkg, tex);
                 }
-                BgMsg::StatusLoaded(st, is_home) => {
+                BgMsg::StatusLoaded(st, is_home, music) => {
                     self.status = st;
                     self.is_default_home = is_home;
+                    self.is_music_active = music;
                 }
                 BgMsg::WeatherLoaded(w) => {
                     self.weather = Some(w);
                     self.ensure_wallpaper(ctx.clone());
+                }
+                BgMsg::CityGeocoded(label, lat, lon) => {
+                    self.config.weather_city = label.clone();
+                    self.config.weather_lat = lat;
+                    self.config.weather_lon = lon;
+                    self.save_config();
+                    self.spawn_load_weather(ctx.clone());
+                    self.show_toast(format!("Weather set to {label}"));
                 }
                 BgMsg::WallpaperLoaded(scene, blur, img) => {
                     if self.wallpaper_loading == Some((scene, blur)) {
@@ -659,6 +719,87 @@ impl AstryxTvApp {
                         self.show_toast(format!("Update failed: {e}"));
                     }
                 },
+            }
+        }
+
+        // Drain Phone Wi-Fi Web Companion commands
+        let cmds: Vec<WebCmd> = self.web_rx.try_iter().collect();
+        for cmd in cmds {
+            self.last_input_at = Instant::now();
+            self.ambient_active = false;
+            match cmd {
+                WebCmd::ClearRam => self.spawn_clear_ram(ctx.clone()),
+                WebCmd::ToggleOverlay => {
+                    self.config.show_fps_meter = !self.config.show_fps_meter;
+                    self.save_config();
+                    let res = bridge::set_fps_overlay(
+                        self.config.show_fps_meter,
+                        self.config.overlay_flags(),
+                    );
+                    self.fps_overlay_active = res == "ON";
+                    self.show_toast(if self.config.show_fps_meter {
+                        "HUD Overlay ON"
+                    } else {
+                        "HUD Overlay OFF"
+                    });
+                }
+                WebCmd::TriggerSleep => bridge::trigger_sleep(),
+                WebCmd::SetCity(q) => {
+                    let tx = self.tx.clone();
+                    let ctx_c = ctx.clone();
+                    std::thread::spawn(move || {
+                        if let Some((lbl, lat, lon)) = weather::geocode_city(&q) {
+                            let _ = tx.send(BgMsg::CityGeocoded(lbl, lat, lon));
+                            ctx_c.request_repaint();
+                        }
+                    });
+                }
+                WebCmd::SetTheme(name) => {
+                    self.config.astryx_theme = match name.as_str() {
+                        "Y2k" => AstryxThemeId::Y2k,
+                        "Matcha" => AstryxThemeId::Matcha,
+                        "Neutral" => AstryxThemeId::Neutral,
+                        _ => AstryxThemeId::Gothic,
+                    };
+                    self.save_config();
+                    self.show_toast(format!("Theme: {}", self.config.astryx_theme.label()));
+                }
+                WebCmd::SetScene(name) => {
+                    self.config.weather_scene = match name.as_str() {
+                        "AuroraBorealis" => WeatherScene::AuroraBorealis,
+                        "LiquidMesh" => WeatherScene::LiquidMesh,
+                        "DeepSpace" => WeatherScene::DeepSpace,
+                        "LiveEarth" => WeatherScene::LiveEarth,
+                        "LiveUkSat" => WeatherScene::LiveUkSat,
+                        _ => WeatherScene::Auto,
+                    };
+                    self.save_config();
+                    self.ensure_wallpaper(ctx.clone());
+                    self.show_toast(format!("Wallpaper: {}", self.config.weather_scene.label()));
+                }
+                WebCmd::CustomWallpaperUploaded(path) => {
+                    self.config.custom_wallpaper_path = path;
+                    self.config.weather_scene = WeatherScene::CustomLocal;
+                    self.wallpaper_tex = None;
+                    self.wallpaper_loading = None;
+                    self.save_config();
+                    self.ensure_wallpaper(ctx.clone());
+                    self.show_toast("Applied custom 4K wallpaper!");
+                }
+                WebCmd::PushA2ui(payload) => {
+                    if let Ok(n) = self.a2ui.process_json(&payload) {
+                        self.show_toast(format!("A2UI: Applied {n} surface message(s)"));
+                    }
+                }
+                WebCmd::ImportConfigJson(json) => {
+                    if let Ok(cfg) = serde_json::from_str::<LauncherConfig>(&json) {
+                        self.config = cfg;
+                        self.save_config();
+                        self.spawn_load_weather(ctx.clone());
+                        self.ensure_wallpaper(ctx.clone());
+                        self.show_toast("Restored backup configuration!");
+                    }
+                }
             }
         }
     }
@@ -1216,6 +1357,77 @@ impl AstryxTvApp {
                     painter.image(tex.id(), rect, uv, Color32::WHITE);
                 }
             }
+        } else if scene == WeatherScene::AuroraBorealis {
+            // Procedural GPU Aurora Borealis shader (zero network, silky 60/120Hz)
+            painter.rect_filled(rect, 0.0, Color32::from_rgb(5, 10, 22));
+            let bands = [
+                (Color32::from_rgba_unmultiplied(16, 185, 129, 36), 0.28, 0.55, 1.4),
+                (Color32::from_rgba_unmultiplied(56, 189, 248, 30), 0.42, 0.42, 2.1),
+                (Color32::from_rgba_unmultiplied(168, 85, 247, 26), 0.54, 0.35, 3.0),
+            ];
+            for (col, y_frac, spd, phase) in bands {
+                for step in 0..18 {
+                    let xf = step as f32 / 17.0;
+                    let x = rect.left() + xf * rect.width();
+                    let wave = ((xf * 4.5 + t * spd + phase).sin() * 44.0)
+                        + ((xf * 2.1 - t * spd * 0.7).cos() * 26.0);
+                    let y = rect.top() + rect.height() * y_frac + wave;
+                    painter.circle_filled(Pos2::new(x, y), 110.0, col);
+                }
+            }
+            if motion {
+                ctx.request_repaint();
+            }
+        } else if scene == WeatherScene::LiquidMesh {
+            // Procedural GPU Liquid Gradient Mesh synced with active theme accent
+            let acc = self.config.accent();
+            let acc2 = self.config.accent2();
+            painter.rect_filled(rect, 0.0, Color32::from_rgb(7, 10, 20));
+            let orbs = [
+                (0.24 + (t * 0.28).sin() * 0.14, 0.30 + (t * 0.22).cos() * 0.12, 260.0, acc, 42u8),
+                (0.76 + (t * 0.24).cos() * 0.15, 0.38 + (t * 0.31).sin() * 0.14, 290.0, acc2, 38u8),
+                (0.50 + (t * 0.19).sin() * 0.18, 0.72 + (t * 0.25).cos() * 0.10, 270.0, acc, 30u8),
+            ];
+            for (xf, yf, r, c, a) in orbs {
+                let p = Pos2::new(rect.left() + rect.width() * xf, rect.top() + rect.height() * yf);
+                painter.circle_filled(p, r, Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a));
+                painter.circle_filled(
+                    p,
+                    r * 0.55,
+                    Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a.saturating_add(16)),
+                );
+            }
+            if motion {
+                ctx.request_repaint();
+            }
+        } else if scene == WeatherScene::DeepSpace {
+            // Procedural GPU Deep Space Nebula + multi-depth twinkling starfield
+            painter.rect_filled(rect, 0.0, Color32::from_rgb(4, 6, 15));
+            painter.circle_filled(
+                Pos2::new(rect.width() * 0.26, rect.height() * 0.30),
+                240.0,
+                Color32::from_rgba_unmultiplied(99, 102, 241, 24),
+            );
+            painter.circle_filled(
+                Pos2::new(rect.width() * 0.74, rect.height() * 0.62),
+                260.0,
+                Color32::from_rgba_unmultiplied(236, 72, 153, 18),
+            );
+            for i in 0..72 {
+                let fx = ((i * 73 + 19) % 1000) as f32 / 1000.0;
+                let fy = ((i * 151 + 43) % 1000) as f32 / 1000.0;
+                let tw = ((t * (1.2 + (i % 5) as f32 * 0.35) + i as f32).sin() * 0.5 + 0.5);
+                let a = (70.0 + tw * 175.0) as u8;
+                let r = if i % 7 == 0 { 1.8 } else { 1.1 };
+                painter.circle_filled(
+                    Pos2::new(rect.left() + fx * rect.width(), rect.top() + fy * rect.height()),
+                    r,
+                    Color32::from_rgba_unmultiplied(235, 244, 255, a),
+                );
+            }
+            if motion {
+                ctx.request_repaint();
+            }
         } else {
             // Fallback atmospheric gradient while wallpaper downloads
             let (top_c, bot_c) = match scene {
@@ -1240,6 +1452,7 @@ impl AstryxTvApp {
                 WeatherScene::Snow => {
                     (Color32::from_rgb(28, 42, 66), Color32::from_rgb(12, 18, 30))
                 }
+                _ => (Color32::from_rgb(10, 16, 32), Color32::from_rgb(5, 8, 16)),
             };
             let mut mesh = egui::Mesh::default();
             mesh.colored_vertex(rect.left_top(), top_c);
@@ -3480,9 +3693,9 @@ impl AstryxTvApp {
             }
 
             ActiveModal::Settings => {
-                // 17 settings (0..17, 4 categories) + row 17 = Android TV Shortcuts (4 columns)
-                const SETTING_COUNT: usize = 17;
-                const SYS_IDX: usize = 17;
+                // 25 settings (0..25, 4 clean categories) + row 25 = Android TV Shortcuts (4 columns)
+                const SETTING_COUNT: usize = 25;
+                const SYS_IDX: usize = 25;
                 const GRID_COLS: usize = 3;
                 let is_grid = self.config.settings_view == SettingsViewMode::Grid;
 
@@ -3596,48 +3809,85 @@ impl AstryxTvApp {
                         this.config.auto_night_dim = !this.config.auto_night_dim;
                         this.save_config();
                     }
-                    // Category 2: WEATHER & STATUS (6..9)
+                    // Category 2: WEATHER & AMBIENT (6..12)
                     6 => {
                         this.config.show_weather = !this.config.show_weather;
                         this.save_config();
                     }
                     7 => {
+                        this.open_modal(ActiveModal::WeatherCity);
+                    }
+                    8 => {
                         this.config.clock_24h = !this.config.clock_24h;
                         this.save_config();
                     }
-                    8 => {
+                    9 => {
                         this.config.show_status_pill = !this.config.show_status_pill;
                         this.save_config();
                     }
-                    // Category 3: APPS & LIBRARY (9..12)
-                    9 => {
+                    10 => {
+                        this.config.show_now_playing = !this.config.show_now_playing;
+                        this.save_config();
+                    }
+                    11 => {
+                        this.config.ambient_timeout_secs = match this.config.ambient_timeout_secs {
+                            0 => 60,
+                            60 => 180,
+                            180 => 300,
+                            _ => 0,
+                        };
+                        this.save_config();
+                    }
+                    // Category 3: APPS & LIBRARY (12..18)
+                    12 => {
                         this.config.sort_order = match this.config.sort_order {
                             SortOrder::Alpha => SortOrder::Recent,
                             SortOrder::Recent => SortOrder::Alpha,
                         };
                         this.save_config();
                     }
-                    10 => {
+                    13 => {
+                        this.active_folder_idx = None;
+                        this.open_modal(ActiveModal::Folders);
+                    }
+                    14 => {
                         this.config.show_mobile_apps = !this.config.show_mobile_apps;
                         this.save_config();
                     }
-                    11 => {
+                    15 => {
+                        this.config.show_system_apps = !this.config.show_system_apps;
+                        this.save_config();
+                    }
+                    16 => {
                         this.config.hidden_apps.clear();
                         this.save_config();
                         this.show_toast("Restored all hidden apps");
                     }
-                    // Category 4: SYSTEM & UPDATES (12..15)
-                    12 => {
-                        this.config.show_system_apps = !this.config.show_system_apps;
+                    17 => {
+                        this.config.auto_clear_ram_on_home = !this.config.auto_clear_ram_on_home;
                         this.save_config();
                     }
-                    13 => {
+                    // Category 4: SYSTEM, COMPANION & UPDATES (18..25)
+                    18 => {
                         let ok = bridge::open_home_settings();
                         if !ok {
                             this.show_toast("Open Android Settings → Apps → Default Home");
                         }
                     }
-                    14 => {
+                    19 => {
+                        this.open_modal(ActiveModal::Overlay);
+                    }
+                    20 => {
+                        this.open_modal(ActiveModal::PowerMenu);
+                    }
+                    21 => {
+                        this.local_ip = bridge::get_local_ip();
+                        this.open_modal(ActiveModal::PhoneCompanion);
+                    }
+                    22 => {
+                        this.open_modal(ActiveModal::Backup);
+                    }
+                    23 => {
                         this.open_modal(ActiveModal::Updater);
                         if matches!(
                             this.updater_state,
@@ -3646,10 +3896,7 @@ impl AstryxTvApp {
                             this.spawn_check_update(ctx.clone(), false);
                         }
                     }
-                    15 => {
-                        this.open_modal(ActiveModal::Overlay);
-                    }
-                    16 => {
+                    24 => {
                         this.open_modal(ActiveModal::Donate);
                     }
                     _ => {}
@@ -3803,11 +4050,23 @@ impl AstryxTvApp {
                                 this.config.auto_night_dim,
                                 8,
                             ),
-                            // WEATHER & STATUS (6..9)
+                            // WEATHER & AMBIENT (6..12)
                             (
-                                "Live London Weather",
+                                "Live Weather",
                                 if this.config.show_weather { "ON" } else { "OFF" }.to_string(),
                                 this.config.show_weather,
+                                4,
+                            ),
+                            (
+                                "Weather City",
+                                this.config
+                                    .weather_city
+                                    .split('·')
+                                    .next()
+                                    .unwrap_or("London")
+                                    .trim()
+                                    .to_string(),
+                                true,
                                 4,
                             ),
                             (
@@ -3822,7 +4081,24 @@ impl AstryxTvApp {
                                 this.config.show_status_pill,
                                 7,
                             ),
-                            // APPS & LIBRARY (9..12)
+                            (
+                                "Now Playing Pill",
+                                if this.config.show_now_playing { "ON" } else { "OFF" }.to_string(),
+                                this.config.show_now_playing,
+                                7,
+                            ),
+                            (
+                                "Ambient Clock",
+                                match this.config.ambient_timeout_secs {
+                                    0 => "OFF".to_string(),
+                                    60 => "1 min".to_string(),
+                                    180 => "3 min".to_string(),
+                                    _ => "5 min".to_string(),
+                                },
+                                this.config.ambient_timeout_secs > 0,
+                                8,
+                            ),
+                            // APPS & LIBRARY (12..18)
                             (
                                 "App Sort Order",
                                 match this.config.sort_order {
@@ -3833,10 +4109,22 @@ impl AstryxTvApp {
                                 2,
                             ),
                             (
+                                "App Folders",
+                                format!("{} folders", this.config.app_folders.len()),
+                                !this.config.app_folders.is_empty(),
+                                201,
+                            ),
+                            (
                                 "Mobile / Sideloaded",
                                 if this.config.show_mobile_apps { "ON" } else { "OFF" }.to_string(),
                                 this.config.show_mobile_apps,
                                 9,
+                            ),
+                            (
+                                "System Apps",
+                                if this.config.show_system_apps { "ON" } else { "OFF" }.to_string(),
+                                this.config.show_system_apps,
+                                10,
                             ),
                             (
                                 "Hidden Apps",
@@ -3844,13 +4132,13 @@ impl AstryxTvApp {
                                 false,
                                 12,
                             ),
-                            // SYSTEM & UPDATES (12..15)
                             (
-                                "System Apps",
-                                if this.config.show_system_apps { "ON" } else { "OFF" }.to_string(),
-                                this.config.show_system_apps,
-                                10,
+                                "Auto-Clear RAM",
+                                if this.config.auto_clear_ram_on_home { "ON" } else { "OFF" }.to_string(),
+                                this.config.auto_clear_ram_on_home,
+                                101,
                             ),
+                            // SYSTEM, COMPANION & UPDATES (18..25)
                             (
                                 "Default Home",
                                 if this.is_default_home {
@@ -3860,6 +4148,34 @@ impl AstryxTvApp {
                                 },
                                 this.is_default_home,
                                 11,
+                            ),
+                            (
+                                "HUD Overlay",
+                                if this.config.show_fps_meter {
+                                    "ON".to_string()
+                                } else {
+                                    "OFF".to_string()
+                                },
+                                this.config.show_fps_meter,
+                                14,
+                            ),
+                            (
+                                "Power & Devices",
+                                "BT · Sleep".to_string(),
+                                false,
+                                100,
+                            ),
+                            (
+                                "Phone Companion",
+                                format!(":{}", WEB_COMPANION_PORT),
+                                this.config.web_companion_enabled,
+                                200,
+                            ),
+                            (
+                                "Backup & Restore",
+                                "JSON".to_string(),
+                                false,
+                                102,
                             ),
                             (
                                 "App Updates",
@@ -3875,16 +4191,6 @@ impl AstryxTvApp {
                                 13,
                             ),
                             (
-                                "HUD Overlay",
-                                if this.config.show_fps_meter {
-                                    "ON".to_string()
-                                } else {
-                                    "OFF".to_string()
-                                },
-                                this.config.show_fps_meter,
-                                14,
-                            ),
-                            (
                                 "Buy Me a Coffee",
                                 "Support".to_string(),
                                 false,
@@ -3892,14 +4198,14 @@ impl AstryxTvApp {
                             ),
                         ];
 
-                        let is_submenu_item = |idx: usize| matches!(idx, 13 | 14 | 15 | 16);
+                        let is_submenu_item = |idx: usize| matches!(idx, 7 | 13 | 18 | 19 | 20 | 21 | 22 | 23 | 24);
 
                         let category_for = |idx: usize| -> Option<&'static str> {
                             match idx {
                                 0 => Some("LAYOUT & DISPLAY"),
-                                6 => Some("WEATHER & STATUS"),
-                                9 => Some("APPS & LIBRARY"),
-                                12 => Some("SYSTEM & UPDATES"),
+                                6 => Some("WEATHER & AMBIENT"),
+                                12 => Some("APPS & LIBRARY"),
+                                18 => Some("SYSTEM, COMPANION & UPDATES"),
                                 _ => None,
                             }
                         };
@@ -4455,16 +4761,33 @@ impl AstryxTvApp {
                     .map(|a| self.display_label(a))
                     .unwrap_or_else(|| pkg.clone());
                 let is_fav = self.config.favorites.contains(&pkg);
+                let cur_folder = self
+                    .config
+                    .app_folders
+                    .iter()
+                    .find(|f| f.packages.contains(&pkg))
+                    .map(|f| f.name.as_str())
+                    .unwrap_or("None");
+                let folder_lbl = format!("Folder: {cur_folder}  (OK cycle)");
 
-                let actions: Vec<(&str, &str)> = vec![
-                    ("open", "Open App"),
-                    ("pin", if is_fav { "Unpin from Favorites" } else { "Pin to Favorites" }),
-                    ("left", "Move App Left"),
-                    ("right", "Move App Right"),
-                    ("rename", "Rename App"),
-                    ("hide", "Hide App"),
-                    ("info", "Android App Info"),
-                    ("uninstall", "Uninstall App"),
+                let actions: Vec<(&str, String)> = vec![
+                    ("open", "Open App".to_string()),
+                    (
+                        "pin",
+                        if is_fav {
+                            "Unpin from Favorites"
+                        } else {
+                            "Pin to Favorites"
+                        }
+                        .to_string(),
+                    ),
+                    ("folder", folder_lbl),
+                    ("left", "Move App Left".to_string()),
+                    ("right", "Move App Right".to_string()),
+                    ("rename", "Rename App".to_string()),
+                    ("hide", "Hide App".to_string()),
+                    ("info", "Android App Info".to_string()),
+                    ("uninstall", "Uninstall App".to_string()),
                 ];
 
                 let mut chosen: Option<&str> = None;
@@ -4524,7 +4847,7 @@ impl AstryxTvApp {
                             p.text(
                                 Pos2::new(rect.left() + 42.0, rect.center().y),
                                 Align2::LEFT_CENTER,
-                                *label,
+                                label.as_str(),
                                 FontId::proportional(14.0),
                                 Color32::WHITE,
                             );
@@ -4545,6 +4868,40 @@ impl AstryxTvApp {
                         "pin" => {
                             self.toggle_favorite(&pkg);
                             self.modal = ActiveModal::None;
+                        }
+                        "folder" => {
+                            const PRESETS: [&str; 4] = ["Streaming", "Live TV", "Games", "Tools"];
+                            let cur_idx = self
+                                .config
+                                .app_folders
+                                .iter()
+                                .find(|f| f.packages.contains(&pkg))
+                                .and_then(|f| PRESETS.iter().position(|n| *n == f.name));
+                            for f in &mut self.config.app_folders {
+                                f.packages.retain(|p| p != &pkg);
+                            }
+                            let next_name = match cur_idx {
+                                None => Some(PRESETS[0]),
+                                Some(i) if i + 1 < PRESETS.len() => Some(PRESETS[i + 1]),
+                                _ => None,
+                            };
+                            if let Some(name) = next_name {
+                                if let Some(f) =
+                                    self.config.app_folders.iter_mut().find(|f| f.name == name)
+                                {
+                                    f.packages.push(pkg.clone());
+                                } else {
+                                    self.config.app_folders.push(AppFolder {
+                                        name: name.to_string(),
+                                        packages: vec![pkg.clone()],
+                                    });
+                                }
+                                self.show_toast(format!("Added to {name} folder"));
+                            } else {
+                                self.show_toast("Removed from folder");
+                            }
+                            self.config.app_folders.retain(|f| !f.packages.is_empty());
+                            self.save_config();
                         }
                         "left" => {
                             self.move_app_order(&pkg, -1);
@@ -5540,6 +5897,550 @@ impl AstryxTvApp {
                     }
                 }
             }
+
+            ActiveModal::WeatherCity => {
+                let count = WEATHER_CITY_PRESETS.len();
+                let mut picked: Option<usize> = None;
+                if allow_keys {
+                    ctx.input(|i| {
+                        if i.key_pressed(Key::ArrowDown) {
+                            self.modal_focus = (self.modal_focus + 1).min(count - 1);
+                            self.modal_focus_changed = true;
+                        } else if i.key_pressed(Key::ArrowUp) {
+                            if self.modal_focus == 0 {
+                                self.modal_close_focused = true;
+                            } else {
+                                self.modal_focus -= 1;
+                                self.modal_focus_changed = true;
+                            }
+                        } else if i.key_pressed(Key::Enter) || i.key_pressed(Key::Space) {
+                            picked = Some(self.modal_focus);
+                        }
+                    });
+                }
+
+                self.draw_modal_shell(
+                    ctx,
+                    "Weather Location  ·  OK select · Phone Companion for any city",
+                    560.0,
+                    410.0,
+                    |this, ui, _ctx| {
+                        let accent = this.config.accent();
+                        ui.label(
+                            RichText::new(format!(
+                                "Current: {}   (Open Phone Companion to search any custom city)",
+                                this.config.weather_city
+                            ))
+                            .font(FontId::proportional(11.5))
+                            .color(Color32::from_rgb(178, 196, 222)),
+                        );
+                        ui.add_space(10.0);
+                        for (idx, (city, _, _)) in WEATHER_CITY_PRESETS.iter().enumerate() {
+                            let focused = this.modal_focus == idx;
+                            let active = this.config.weather_city == *city;
+                            let w = ui.available_width();
+                            let (rect, resp) =
+                                ui.allocate_exact_size(Vec2::new(w, 38.0), Sense::click());
+                            let p = ui.painter();
+                            p.rect_filled(
+                                rect,
+                                CornerRadius::same(10),
+                                if focused {
+                                    Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 65)
+                                } else {
+                                    Color32::from_rgba_unmultiplied(255, 255, 255, 11)
+                                },
+                            );
+                            p.rect_stroke(
+                                rect,
+                                CornerRadius::same(10),
+                                if focused {
+                                    Stroke::new(2.0_f32, accent)
+                                } else {
+                                    Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(255, 255, 255, 20))
+                                },
+                                egui::StrokeKind::Inside,
+                            );
+                            p.text(
+                                Pos2::new(rect.left() + 16.0, rect.center().y),
+                                Align2::LEFT_CENTER,
+                                *city,
+                                FontId::proportional(14.0),
+                                Color32::WHITE,
+                            );
+                            if active {
+                                p.text(
+                                    Pos2::new(rect.right() - 16.0, rect.center().y),
+                                    Align2::RIGHT_CENTER,
+                                    "✓ Active",
+                                    FontId::proportional(12.0),
+                                    Color32::from_rgb(52, 211, 153),
+                                );
+                            }
+                            if focused && this.modal_focus_changed {
+                                resp.scroll_to_me(Some(Align::Center));
+                                this.modal_focus_changed = false;
+                            }
+                            if resp.clicked() {
+                                picked = Some(idx);
+                            }
+                            ui.add_space(5.0);
+                        }
+                    },
+                );
+
+                if let Some(idx) = picked {
+                    let (name, lat, lon) = WEATHER_CITY_PRESETS[idx];
+                    self.config.weather_city = name.to_string();
+                    self.config.weather_lat = lat;
+                    self.config.weather_lon = lon;
+                    self.save_config();
+                    self.spawn_load_weather(ctx.clone());
+                    self.show_toast(format!("Weather set to {name}"));
+                    self.close_modal_step();
+                }
+            }
+
+            ActiveModal::Folders => {
+                let folders = self.config.app_folders.clone();
+                let mut open_folder: Option<usize> = None;
+                let mut launch_pkg: Option<String> = None;
+
+                if let Some(fi) = self.active_folder_idx {
+                    if let Some(folder) = folders.get(fi) {
+                        let f_apps: Vec<TvAppInfo> = folder
+                            .packages
+                            .iter()
+                            .filter_map(|p| self.apps.iter().find(|a| &a.package_name == p).cloned())
+                            .collect();
+                        if allow_keys {
+                            ctx.input(|i| {
+                                if i.key_pressed(Key::ArrowDown) && !f_apps.is_empty() {
+                                    self.modal_focus = (self.modal_focus + 1).min(f_apps.len() - 1);
+                                } else if i.key_pressed(Key::ArrowUp) {
+                                    if self.modal_focus == 0 {
+                                        self.modal_close_focused = true;
+                                    } else {
+                                        self.modal_focus -= 1;
+                                    }
+                                } else if (i.key_pressed(Key::Enter) || i.key_pressed(Key::Space))
+                                    && self.modal_focus < f_apps.len()
+                                {
+                                    launch_pkg = Some(f_apps[self.modal_focus].package_name.clone());
+                                }
+                            });
+                        }
+                        self.draw_modal_shell(
+                            ctx,
+                            &format!("Folder · {}  (OK launch · BACK close)", folder.name),
+                            560.0,
+                            380.0,
+                            |this, ui, _ctx| {
+                                let accent = this.config.accent();
+                                for (idx, app) in f_apps.iter().enumerate() {
+                                    let focused = this.modal_focus == idx;
+                                    let w = ui.available_width();
+                                    let (rect, resp) =
+                                        ui.allocate_exact_size(Vec2::new(w, 44.0), Sense::click());
+                                    let p = ui.painter();
+                                    p.rect_filled(
+                                        rect,
+                                        CornerRadius::same(10),
+                                        if focused {
+                                            Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 65)
+                                        } else {
+                                            Color32::from_rgba_unmultiplied(255, 255, 255, 11)
+                                        },
+                                    );
+                                    p.rect_stroke(
+                                        rect,
+                                        CornerRadius::same(10),
+                                        if focused {
+                                            Stroke::new(2.0_f32, accent)
+                                        } else {
+                                            Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(255, 255, 255, 20))
+                                        },
+                                        egui::StrokeKind::Inside,
+                                    );
+                                    let ic_c = Pos2::new(rect.left() + 24.0, rect.center().y);
+                                    if let Some(tex) = this.icon_textures.get(&app.package_name) {
+                                        p.image(
+                                            tex.id(),
+                                            Rect::from_center_size(ic_c, Vec2::splat(28.0)),
+                                            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                                            Color32::WHITE,
+                                        );
+                                    }
+                                    p.text(
+                                        Pos2::new(rect.left() + 48.0, rect.center().y),
+                                        Align2::LEFT_CENTER,
+                                        this.display_label(app),
+                                        FontId::proportional(14.5),
+                                        Color32::WHITE,
+                                    );
+                                    if resp.clicked() {
+                                        launch_pkg = Some(app.package_name.clone());
+                                    }
+                                    ui.add_space(6.0);
+                                }
+                            },
+                        );
+                    } else {
+                        self.active_folder_idx = None;
+                    }
+                } else {
+                    if allow_keys {
+                        ctx.input(|i| {
+                            if i.key_pressed(Key::ArrowDown) && !folders.is_empty() {
+                                self.modal_focus = (self.modal_focus + 1).min(folders.len() - 1);
+                            } else if i.key_pressed(Key::ArrowUp) {
+                                if self.modal_focus == 0 {
+                                    self.modal_close_focused = true;
+                                } else {
+                                    self.modal_focus -= 1;
+                                }
+                            } else if (i.key_pressed(Key::Enter) || i.key_pressed(Key::Space))
+                                && self.modal_focus < folders.len()
+                            {
+                                open_folder = Some(self.modal_focus);
+                            }
+                        });
+                    }
+                    self.draw_modal_shell(
+                        ctx,
+                        "App Folders  ·  Hold OK on any app to assign folders",
+                        580.0,
+                        360.0,
+                        |this, ui, _ctx| {
+                            let accent = this.config.accent();
+                            if folders.is_empty() {
+                                ui.add_space(40.0);
+                                ui.vertical_centered(|ui| {
+                                    ui.label(
+                                        RichText::new("No folders created yet")
+                                            .font(FontId::proportional(16.0))
+                                            .strong()
+                                            .color(Color32::WHITE),
+                                    );
+                                    ui.add_space(6.0);
+                                    ui.label(
+                                        RichText::new(
+                                            "Hold OK on any app on Home → choose 'Folder' to group apps into Streaming, Live TV, Games, or Tools.",
+                                        )
+                                        .font(FontId::proportional(12.5))
+                                        .color(Color32::from_rgb(185, 202, 226)),
+                                    );
+                                });
+                            } else {
+                                for (idx, f) in folders.iter().enumerate() {
+                                    let focused = this.modal_focus == idx;
+                                    let w = ui.available_width();
+                                    let (rect, resp) =
+                                        ui.allocate_exact_size(Vec2::new(w, 46.0), Sense::click());
+                                    let p = ui.painter();
+                                    p.rect_filled(
+                                        rect,
+                                        CornerRadius::same(12),
+                                        if focused {
+                                            Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 65)
+                                        } else {
+                                            Color32::from_rgba_unmultiplied(255, 255, 255, 12)
+                                        },
+                                    );
+                                    p.rect_stroke(
+                                        rect,
+                                        CornerRadius::same(12),
+                                        if focused {
+                                            Stroke::new(2.0_f32, accent)
+                                        } else {
+                                            Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(255, 255, 255, 22))
+                                        },
+                                        egui::StrokeKind::Inside,
+                                    );
+                                    p.text(
+                                        Pos2::new(rect.left() + 16.0, rect.center().y),
+                                        Align2::LEFT_CENTER,
+                                        &f.name,
+                                        FontId::proportional(15.0),
+                                        Color32::WHITE,
+                                    );
+                                    p.text(
+                                        Pos2::new(rect.right() - 18.0, rect.center().y),
+                                        Align2::RIGHT_CENTER,
+                                        format!("{} apps  ›", f.packages.len()),
+                                        FontId::proportional(12.5),
+                                        accent,
+                                    );
+                                    if resp.clicked() {
+                                        open_folder = Some(idx);
+                                    }
+                                    ui.add_space(6.0);
+                                }
+                            }
+                        },
+                    );
+                }
+
+                if let Some(fi) = open_folder {
+                    self.active_folder_idx = Some(fi);
+                    self.modal_focus = 0;
+                    self.modal_just_opened = true;
+                }
+                if let Some(pkg) = launch_pkg {
+                    self.active_folder_idx = None;
+                    self.modal = ActiveModal::None;
+                    self.modal_stack.clear();
+                    self.launch_app(&pkg);
+                }
+            }
+
+            ActiveModal::PowerMenu => {
+                let mut action: Option<usize> = None;
+                if allow_keys {
+                    ctx.input(|i| {
+                        if i.key_pressed(Key::ArrowDown) {
+                            self.modal_focus = (self.modal_focus + 1).min(3);
+                        } else if i.key_pressed(Key::ArrowUp) {
+                            if self.modal_focus == 0 {
+                                self.modal_close_focused = true;
+                            } else {
+                                self.modal_focus -= 1;
+                            }
+                        } else if i.key_pressed(Key::Enter) || i.key_pressed(Key::Space) {
+                            action = Some(self.modal_focus);
+                        }
+                    });
+                }
+
+                self.draw_modal_shell(
+                    ctx,
+                    "Power & Devices  ·  Bluetooth · Display · Ambient · Sleep",
+                    560.0,
+                    320.0,
+                    |this, ui, _ctx| {
+                        let accent = this.config.accent();
+                        let rows = [
+                            ("Bluetooth Audio & Devices", "Pair or switch headphones / soundbar", 200),
+                            ("Display & HDMI Settings", "Picture mode, 4K resolution & HDR", 100),
+                            ("Start Ambient Clock Now", "OLED-safe giant UK clock & live sky", 8),
+                            ("TV Sleep / Daydream", "Launch Android TV system screensaver", 101),
+                        ];
+                        for (idx, (title, sub, ic)) in rows.iter().enumerate() {
+                            let focused = this.modal_focus == idx;
+                            let resp = egui::Frame::NONE
+                                .fill(if focused {
+                                    Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 52)
+                                } else {
+                                    Color32::from_rgba_unmultiplied(255, 255, 255, 11)
+                                })
+                                .stroke(if focused {
+                                    Stroke::new(2.0_f32, accent)
+                                } else {
+                                    Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(255, 255, 255, 20))
+                                })
+                                .corner_radius(CornerRadius::same(12))
+                                .inner_margin(egui::Margin::symmetric(14, 9))
+                                .show(ui, |ui| {
+                                    ui.set_min_width(ui.available_width());
+                                    ui.horizontal(|ui| {
+                                        let (ir, _) = ui.allocate_exact_size(Vec2::splat(26.0), Sense::hover());
+                                        Self::draw_setting_icon(ui.painter(), ir.center(), *ic, Color32::WHITE);
+                                        ui.add_space(6.0);
+                                        ui.vertical(|ui| {
+                                            ui.label(RichText::new(*title).font(FontId::proportional(14.0)).strong().color(Color32::WHITE));
+                                            ui.label(RichText::new(*sub).font(FontId::proportional(11.0)).color(Color32::from_rgb(176, 194, 220)));
+                                        });
+                                    });
+                                })
+                                .response;
+                            if resp.clicked() {
+                                action = Some(idx);
+                            }
+                            ui.add_space(6.0);
+                        }
+                    },
+                );
+
+                if let Some(a) = action {
+                    match a {
+                        0 => bridge::open_system_settings("bluetooth"),
+                        1 => bridge::open_system_settings("display"),
+                        2 => {
+                            self.modal = ActiveModal::None;
+                            self.modal_stack.clear();
+                            self.ambient_active = true;
+                        }
+                        _ => bridge::trigger_sleep(),
+                    }
+                }
+            }
+
+            ActiveModal::PhoneCompanion => {
+                let url = format!("http://{}:{WEB_COMPANION_PORT}", self.local_ip);
+                if allow_keys {
+                    ctx.input(|i| {
+                        if i.key_pressed(Key::ArrowUp) {
+                            self.modal_close_focused = true;
+                        } else if i.key_pressed(Key::Enter) || i.key_pressed(Key::Space) {
+                            self.close_modal_step();
+                        }
+                    });
+                }
+
+                self.draw_modal_shell(
+                    ctx,
+                    "Phone Wi-Fi Companion  ·  Scan with Phone",
+                    640.0,
+                    365.0,
+                    |this, ui, _ctx| {
+                        let accent = this.config.accent();
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 22.0;
+                            egui::Frame::NONE
+                                .fill(Color32::WHITE)
+                                .stroke(Stroke::new(2.0_f32, accent))
+                                .corner_radius(CornerRadius::same(16))
+                                .inner_margin(egui::Margin::same(12))
+                                .show(ui, |ui| {
+                                    let qr_px = 186.0;
+                                    let (qr_rect, _) = ui.allocate_exact_size(Vec2::splat(qr_px), Sense::hover());
+                                    let p = ui.painter();
+                                    if let Ok(code) = qrcode::QrCode::new(url.as_bytes()) {
+                                        let width = code.width();
+                                        let cell = qr_px / width as f32;
+                                        for y in 0..width {
+                                            for x in 0..width {
+                                                if code[(x, y)] == qrcode::Color::Dark {
+                                                    let min = Pos2::new(
+                                                        qr_rect.left() + x as f32 * cell,
+                                                        qr_rect.top() + y as f32 * cell,
+                                                    );
+                                                    p.rect_filled(
+                                                        Rect::from_min_max(
+                                                            min,
+                                                            Pos2::new(min.x + cell + 0.35, min.y + cell + 0.35),
+                                                        ),
+                                                        0.0,
+                                                        Color32::from_rgb(14, 18, 28),
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                });
+
+                            ui.vertical(|ui| {
+                                ui.label(
+                                    RichText::new("Control Your TV From Your Phone")
+                                        .font(FontId::proportional(17.0))
+                                        .strong()
+                                        .color(Color32::WHITE),
+                                );
+                                ui.add_space(8.0);
+                                ui.label(
+                                    RichText::new(
+                                        "Scan the QR code on the same Wi-Fi to:\n• Search & set any Weather City worldwide\n• Upload custom 4K wallpapers from your gallery\n• Clear RAM, switch themes & toggle HUD Overlay\n• Download or restore full JSON settings backups",
+                                    )
+                                    .font(FontId::proportional(12.5))
+                                    .color(Color32::from_rgb(200, 214, 236)),
+                                );
+                                ui.add_space(12.0);
+                                egui::Frame::NONE
+                                    .fill(Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 32))
+                                    .stroke(Stroke::new(1.0_f32, accent))
+                                    .corner_radius(CornerRadius::same(10))
+                                    .inner_margin(egui::Margin::symmetric(12, 7))
+                                    .show(ui, |ui| {
+                                        ui.label(
+                                            RichText::new(&url)
+                                                .font(FontId::proportional(13.5))
+                                                .strong()
+                                                .color(Color32::WHITE),
+                                        );
+                                    });
+                            });
+                        });
+                    },
+                );
+            }
+
+            ActiveModal::Backup => {
+                let mut action: Option<u8> = None;
+                if allow_keys {
+                    ctx.input(|i| {
+                        if i.key_pressed(Key::ArrowLeft) {
+                            self.modal_focus = self.modal_focus.saturating_sub(1);
+                        } else if i.key_pressed(Key::ArrowRight) {
+                            self.modal_focus = (self.modal_focus + 1).min(1);
+                        } else if i.key_pressed(Key::ArrowUp) {
+                            self.modal_close_focused = true;
+                        } else if i.key_pressed(Key::Enter) || i.key_pressed(Key::Space) {
+                            action = Some(self.modal_focus as u8);
+                        }
+                    });
+                }
+
+                self.draw_modal_shell(
+                    ctx,
+                    "Backup & Restore  ·  Launcher Configuration JSON",
+                    560.0,
+                    250.0,
+                    |this, ui, _ctx| {
+                        let accent = this.config.accent();
+                        ui.label(
+                            RichText::new(
+                                "Save or restore all pinned favorites, custom app names, folders, themes, weather city, and HUD overlay settings.",
+                            )
+                            .font(FontId::proportional(13.0))
+                            .color(Color32::from_rgb(200, 214, 236)),
+                        );
+                        ui.add_space(10.0);
+                        ui.label(
+                            RichText::new("Tip: You can also download/upload JSON backups from your phone via Phone Companion.")
+                                .font(FontId::proportional(11.5))
+                                .color(Color32::from_rgb(165, 184, 212)),
+                        );
+                        ui.add_space(18.0);
+                        ui.horizontal(|ui| {
+                            if Self::modal_btn(ui, "Export Backup", true, this.modal_focus == 0, accent) {
+                                action = Some(0);
+                            }
+                            ui.add_space(8.0);
+                            if Self::modal_btn(ui, "Restore Backup", false, this.modal_focus == 1, accent) {
+                                action = Some(1);
+                            }
+                        });
+                    },
+                );
+
+                if let Some(a) = action {
+                    if a == 0 {
+                        if let Ok(json) = serde_json::to_string_pretty(&self.config) {
+                            let res = bridge::export_backup(&json);
+                            if res.starts_with("ERR:") {
+                                self.show_toast(format!("Backup error: {res}"));
+                            } else {
+                                self.show_toast("✓ Exported astryx_launcher_backup.json");
+                            }
+                        }
+                    } else {
+                        let raw = bridge::import_backup();
+                        if raw.is_empty() {
+                            self.show_toast("No backup file found yet");
+                        } else if let Ok(cfg) = serde_json::from_str::<LauncherConfig>(&raw) {
+                            self.config = cfg;
+                            self.save_config();
+                            self.spawn_load_weather(ctx.clone());
+                            self.ensure_wallpaper(ctx.clone());
+                            self.show_toast("✓ Restored launcher backup!");
+                            self.close_modal_step();
+                        } else {
+                            self.show_toast("Backup file is invalid JSON");
+                        }
+                    }
+                }
+            }
         }
     }
     fn draw_zenith_home(&mut self, ctx: &egui::Context, visible: &[TvAppInfo]) {
@@ -5602,10 +6503,17 @@ impl AstryxTvApp {
                                 if self.config.show_weather {
                                     let w_focused = self.modal == ActiveModal::None
                                         && self.focus == FocusTarget::Weather;
+                                    let city_short = self
+                                        .config
+                                        .weather_city
+                                        .split('·')
+                                        .next()
+                                        .unwrap_or("London")
+                                        .trim();
                                     let w_txt = if let Some(w) = &self.weather {
-                                        format!("{} {} · London ›", self.fmt_temp(w.temp_c), w.condition)
+                                        format!("{} {} · {city_short} ›", self.fmt_temp(w.temp_c), w.condition)
                                     } else {
-                                        "London Weather ›".to_string()
+                                        format!("{city_short} Weather ›")
                                     };
                                     let w_fill = if w_focused {
                                         Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 72)
@@ -6011,6 +6919,69 @@ impl eframe::App for AstryxTvApp {
         let screen = ctx.screen_rect();
         self.draw_background(ctx, screen);
 
+        // Track user input for Ambient Clock Screensaver auto-idle
+        let had_input = ctx.input(|i| {
+            !i.events.is_empty()
+                || i.pointer.any_pressed()
+                || i.pointer.any_released()
+        });
+        if had_input {
+            self.last_input_at = Instant::now();
+            if self.ambient_active {
+                self.ambient_active = false;
+                return;
+            }
+        } else if !self.ambient_active
+            && self.modal == ActiveModal::None
+            && self.config.ambient_timeout_secs > 0
+            && self.last_input_at.elapsed().as_secs() >= self.config.ambient_timeout_secs as u64
+        {
+            self.ambient_active = true;
+        }
+
+        // Ambient Clock Screensaver Mode (OLED-safe gentle Lissajous pixel drift)
+        if self.ambient_active {
+            let t = self.start_time.elapsed().as_secs_f32();
+            let shift = Vec2::new((t * 0.14).sin() * 26.0, (t * 0.11).cos() * 14.0);
+            let time_str = self.cached_time_str.clone();
+            let date_str = self.cached_date_str.clone();
+            let w_line = self
+                .weather
+                .as_ref()
+                .map(|w| format!("{}  ·  {}", self.fmt_temp(w.temp_c), w.condition))
+                .unwrap_or_default();
+
+            egui::Area::new(egui::Id::new("ambient_screensaver"))
+                .anchor(Align2::CENTER_CENTER, shift)
+                .order(egui::Order::Foreground)
+                .show(ctx, |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.label(
+                            RichText::new(&time_str)
+                                .font(FontId::proportional(92.0))
+                                .strong()
+                                .color(Color32::from_rgba_unmultiplied(255, 255, 255, 235)),
+                        );
+                        ui.label(
+                            RichText::new(&date_str)
+                                .font(FontId::proportional(20.0))
+                                .color(Color32::from_rgba_unmultiplied(215, 228, 246, 200)),
+                        );
+                        if !w_line.is_empty() {
+                            ui.add_space(10.0);
+                            ui.label(
+                                RichText::new(w_line)
+                                    .font(FontId::proportional(18.0))
+                                    .strong()
+                                    .color(self.config.accent()),
+                            );
+                        }
+                    });
+                });
+            ctx.request_repaint_after(Duration::from_millis(500));
+            return;
+        }
+
         let visible = Arc::clone(&self.cached_visible);
         let favs = Arc::clone(&self.cached_favs);
 
@@ -6131,6 +7102,7 @@ impl eframe::App for AstryxTvApp {
 
         // Interactive Clear RAM & Live Status Pill (bottom-left, D-pad Down from apps to focus!)
         let mut do_clear_ram = false;
+        let mut do_play_pause = false;
         {
             let accent = self.config.accent();
             let ram_focused = self.modal == ActiveModal::None && self.focus == FocusTarget::RamPill;
@@ -6204,6 +7176,33 @@ impl eframe::App for AstryxTvApp {
                             do_clear_ram = true;
                         }
 
+                        // Live Now Playing Pill (clickable to Play/Pause active media)
+                        if self.config.show_now_playing && self.is_music_active {
+                            let np_resp = egui::Frame::NONE
+                                .fill(Color32::from_rgba_unmultiplied(
+                                    accent.r(),
+                                    accent.g(),
+                                    accent.b(),
+                                    58,
+                                ))
+                                .stroke(Stroke::new(1.2_f32, accent))
+                                .corner_radius(CornerRadius::same(14))
+                                .inner_margin(egui::Margin::symmetric(10, 4))
+                                .show(ui, |ui| {
+                                    ui.label(
+                                        RichText::new("♫ Now Playing · Play/Pause")
+                                            .font(FontId::proportional(11.5))
+                                            .strong()
+                                            .color(Color32::WHITE),
+                                    );
+                                })
+                                .response
+                                .interact(Sense::click());
+                            if np_resp.clicked() {
+                                do_play_pause = true;
+                            }
+                        }
+
                         // Compact Live Network & VPN Pill (when enabled in Settings)
                         if self.config.show_status_pill {
                             egui::Frame::NONE
@@ -6251,6 +7250,10 @@ impl eframe::App for AstryxTvApp {
         }
         if do_clear_ram {
             self.spawn_clear_ram(ctx.clone());
+        }
+        if do_play_pause {
+            bridge::media_play_pause();
+            self.show_toast("Toggled Play / Pause");
         }
 
         // Subtle bottom-right remote control hint pill

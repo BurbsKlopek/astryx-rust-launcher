@@ -107,14 +107,54 @@ fn to_mins(hm: &str) -> i32 {
     h * 60 + m
 }
 
-pub fn fetch_london_weather() -> Option<WeatherData> {
-    let url = "https://api.open-meteo.com/v1/forecast?latitude=51.5074&longitude=-0.1278\
+#[derive(Deserialize)]
+struct GeoResp {
+    results: Option<Vec<GeoItem>>,
+}
+
+#[derive(Deserialize)]
+struct GeoItem {
+    name: String,
+    country_code: Option<String>,
+    latitude: f64,
+    longitude: f64,
+}
+
+pub fn geocode_city(query: &str) -> Option<(String, f64, f64)> {
+    let q = query.trim();
+    if q.is_empty() {
+        return None;
+    }
+    let encoded: String = q
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' => (b as char).to_string(),
+            b' ' => "+".to_string(),
+            _ => format!("%{:02X}", b),
+        })
+        .collect();
+    let url = format!(
+        "https://geocoding-api.open-meteo.com/v1/search?name={encoded}&count=1&language=en&format=json"
+    );
+    let resp: GeoResp = ureq::get(&url).call().ok()?.into_json().ok()?;
+    let item = resp.results?.into_iter().next()?;
+    let label = match item.country_code {
+        Some(cc) if !cc.is_empty() => format!("{} · {}", item.name, cc),
+        _ => item.name,
+    };
+    Some((label, item.latitude, item.longitude))
+}
+
+pub fn fetch_weather_for(lat: f64, lon: f64) -> Option<WeatherData> {
+    let url = format!(
+        "https://api.open-meteo.com/v1/forecast?latitude={lat:.4}&longitude={lon:.4}\
         &current=temperature_2m,apparent_temperature,relative_humidity_2m,wind_speed_10m,weather_code,is_day\
         &hourly=temperature_2m,precipitation_probability,weather_code\
         &daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max,sunrise,sunset\
-        &timezone=Europe%2FLondon&forecast_days=5";
+        &timezone=auto&forecast_days=5"
+    );
 
-    let resp: OpenMeteoResp = ureq::get(url).call().ok()?.into_json().ok()?;
+    let resp: OpenMeteoResp = ureq::get(&url).call().ok()?.into_json().ok()?;
     let cur = resp.current?;
     let temp_c = cur.temperature_2m?.round() as i32;
     let feels_like_c = cur.apparent_temperature.unwrap_or(temp_c as f64).round() as i32;
@@ -281,16 +321,32 @@ pub fn scene_photo_url(scene: WeatherScene) -> &'static str {
         WeatherScene::LiveEarth => {
             "https://cdn.star.nesdis.noaa.gov/GOES19/ABI/FD/GEOCOLOR/1808x1808.jpg"
         }
+        WeatherScene::AuroraBorealis
+        | WeatherScene::LiquidMesh
+        | WeatherScene::DeepSpace
+        | WeatherScene::CustomLocal => "",
     }
 }
 
-pub fn fetch_wallpaper_image(scene: WeatherScene, blur_level: u8) -> Option<ColorImage> {
+pub fn fetch_wallpaper_image(
+    scene: WeatherScene,
+    blur_level: u8,
+    custom_path: &str,
+) -> Option<ColorImage> {
+    if scene.is_procedural_shader() {
+        return None;
+    }
     let is_live_sat = matches!(scene, WeatherScene::LiveUkSat | WeatherScene::LiveEarth);
     let cache_path = format!(
         "/data/user/0/com.astryxtv.rustlauncher/cache/wp_{scene:?}.bin"
     );
 
-    let bytes = if !is_live_sat {
+    let bytes = if scene == WeatherScene::CustomLocal {
+        if custom_path.is_empty() {
+            return None;
+        }
+        std::fs::read(custom_path).ok()?
+    } else if !is_live_sat {
         if let Ok(cached) = std::fs::read(&cache_path) {
             if !cached.is_empty() {
                 cached

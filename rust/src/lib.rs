@@ -4,6 +4,7 @@ mod bridge;
 mod theme;
 mod updater;
 mod weather;
+mod web_server;
 
 use android_activity::AndroidApp;
 use app::AstryxTvApp;
