@@ -5678,17 +5678,8 @@ impl eframe::App for AstryxTvApp {
                 Color32::from_rgb(248, 113, 113)
             };
 
-            let is_zenith = self.config.layout_style == LayoutStyle::Zenith;
-            let fps_offset = if !is_zenith && self.config.show_header && self.config.show_weather {
-                Vec2::new(-336.0, 19.0)
-            } else if is_zenith && self.config.show_header {
-                Vec2::new(-28.0, 68.0)
-            } else {
-                Vec2::new(-28.0, 18.0)
-            };
-
             egui::Area::new(egui::Id::new("fps_meter_pill"))
-                .anchor(Align2::RIGHT_TOP, fps_offset)
+                .anchor(Align2::CENTER_TOP, Vec2::new(0.0, 18.0))
                 .order(egui::Order::Tooltip)
                 .interactable(false)
                 .show(ctx, |ui| {
@@ -5708,10 +5699,13 @@ impl eframe::App for AstryxTvApp {
                                 ui.painter().circle_filled(dr.center(), 3.2, dot_c);
                                 ui.add(
                                     egui::Label::new(
-                                        RichText::new(format!("{fps_val} FPS"))
-                                            .font(FontId::proportional(11.5))
-                                            .strong()
-                                            .color(Color32::WHITE),
+                                        RichText::new(format!(
+                                            "{fps_val} FPS · {:.0}Hz",
+                                            self.display_hz
+                                        ))
+                                        .font(FontId::proportional(11.5))
+                                        .strong()
+                                        .color(Color32::WHITE),
                                     )
                                     .extend(),
                                 );

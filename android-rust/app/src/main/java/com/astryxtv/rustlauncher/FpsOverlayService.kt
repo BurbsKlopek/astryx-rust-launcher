@@ -11,11 +11,13 @@ import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.hardware.display.DisplayManager
 import android.os.Build
 import android.os.IBinder
 import android.provider.Settings
 import android.util.TypedValue
 import android.view.Choreographer
+import android.view.Display
 import android.view.Gravity
 import android.view.View
 import android.view.WindowManager
@@ -166,7 +168,8 @@ class FpsOverlayService : Service() {
         }
 
         val tv = TextView(this).apply {
-            text = "60 FPS"
+            val hz = currentRefreshHz()
+            text = "$hz FPS · ${hz}Hz"
             setTextColor(Color.WHITE)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
             typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
@@ -193,8 +196,8 @@ class FpsOverlayService : Service() {
                 WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
             PixelFormat.TRANSLUCENT
         ).apply {
-            gravity = Gravity.TOP or Gravity.END
-            x = dp(20f)
+            gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+            x = 0
             y = dp(14f)
         }
 
@@ -208,11 +211,22 @@ class FpsOverlayService : Service() {
         }
     }
 
+    private fun currentRefreshHz(): Int {
+        return try {
+            val dm = getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager
+            val hz = dm?.getDisplay(Display.DEFAULT_DISPLAY)?.refreshRate ?: 60f
+            hz.roundToInt().coerceIn(24, 240)
+        } catch (_: Throwable) {
+            60
+        }
+    }
+
     private fun updatePill(fps: Int) {
-        fpsText?.text = "$fps FPS"
+        val hz = currentRefreshHz()
+        fpsText?.text = "$fps FPS · ${hz}Hz"
         val color = when {
-            fps >= 52 -> Color.rgb(52, 211, 153)
-            fps >= 35 -> Color.rgb(251, 191, 36)
+            fps >= (hz - 6).coerceAtLeast(22) -> Color.rgb(52, 211, 153)
+            fps >= (hz * 0.6f).roundToInt() -> Color.rgb(251, 191, 36)
             else -> Color.rgb(248, 113, 113)
         }
         (dotView?.background as? GradientDrawable)?.setColor(color)
