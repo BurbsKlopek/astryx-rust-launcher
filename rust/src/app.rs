@@ -3538,34 +3538,19 @@ impl AstryxTvApp {
                                             egui::StrokeKind::Inside,
                                         );
 
-                                        // Top-left circular color-coded vector icon badge
+                                        // Top-left frosted circle with color-coded vector icon inside
                                         let ic_c = Pos2::new(rect.left() + 26.0, rect.top() + 26.0);
                                         let tc = Self::theme_icon_color(idx, accent);
                                         p.circle_filled(
                                             ic_c,
                                             13.5,
-                                            Color32::from_rgba_unmultiplied(
-                                                tc.r(),
-                                                tc.g(),
-                                                tc.b(),
-                                                if focused { 115 } else { 48 },
-                                            ),
+                                            if focused {
+                                                Color32::from_rgba_unmultiplied(255, 255, 255, 34)
+                                            } else {
+                                                Color32::from_rgba_unmultiplied(255, 255, 255, 18)
+                                            },
                                         );
-                                        p.circle_stroke(
-                                            ic_c,
-                                            13.5,
-                                            Stroke::new(
-                                                1.0_f32,
-                                                Color32::from_rgba_unmultiplied(tc.r(), tc.g(), tc.b(), 110),
-                                            ),
-                                        );
-                                        Self::draw_theme_icon(
-                                            p,
-                                            ic_c,
-                                            idx,
-                                            if focused { Color32::WHITE } else { tc },
-                                            accent,
-                                        );
+                                        Self::draw_theme_icon(p, ic_c, idx, tc, accent);
 
                                         // Top-right color-coded value pill
                                         let pill_w = (val.len() as f32 * 6.8 + 20.0).clamp(52.0, 128.0);
@@ -3664,20 +3649,13 @@ impl AstryxTvApp {
                                         ui.painter().circle_filled(
                                             ic_r.center(),
                                             11.5,
-                                            Color32::from_rgba_unmultiplied(
-                                                tc.r(),
-                                                tc.g(),
-                                                tc.b(),
-                                                if focused { 105 } else { 46 },
-                                            ),
+                                            if focused {
+                                                Color32::from_rgba_unmultiplied(255, 255, 255, 32)
+                                            } else {
+                                                Color32::from_rgba_unmultiplied(255, 255, 255, 16)
+                                            },
                                         );
-                                        Self::draw_theme_icon(
-                                            ui.painter(),
-                                            ic_r.center(),
-                                            idx,
-                                            if focused { Color32::WHITE } else { tc },
-                                            accent,
-                                        );
+                                        Self::draw_theme_icon(ui.painter(), ic_r.center(), idx, tc, accent);
                                         ui.add_space(4.0);
                                         ui.label(
                                             RichText::new(*label)
@@ -4338,33 +4316,19 @@ impl AstryxTvApp {
                                             egui::StrokeKind::Inside,
                                         );
 
-                                        // Top-left circular color-coded icon badge
+                                        // Top-left frosted circle with color-coded vector icon inside
                                         let ic_c = Pos2::new(rect.left() + 22.0, rect.top() + 20.0);
                                         let sc = Self::setting_icon_color(*icon_id);
                                         p.circle_filled(
                                             ic_c,
-                                            12.0,
-                                            Color32::from_rgba_unmultiplied(
-                                                sc.r(),
-                                                sc.g(),
-                                                sc.b(),
-                                                if focused { 115 } else { 48 },
-                                            ),
+                                            11.5,
+                                            if focused {
+                                                Color32::from_rgba_unmultiplied(255, 255, 255, 34)
+                                            } else {
+                                                Color32::from_rgba_unmultiplied(255, 255, 255, 18)
+                                            },
                                         );
-                                        p.circle_stroke(
-                                            ic_c,
-                                            12.0,
-                                            Stroke::new(
-                                                1.0_f32,
-                                                Color32::from_rgba_unmultiplied(sc.r(), sc.g(), sc.b(), 105),
-                                            ),
-                                        );
-                                        Self::draw_setting_icon(
-                                            p,
-                                            ic_c,
-                                            *icon_id,
-                                            if focused { Color32::WHITE } else { sc },
-                                        );
+                                        Self::draw_setting_icon(p, ic_c, *icon_id, sc);
 
                                         // Top-right status pill badge
                                         let pill_w = (val.len() as f32 * 6.8 + 18.0).clamp(48.0, 108.0);
@@ -4482,19 +4446,13 @@ impl AstryxTvApp {
                                             ui.painter().circle_filled(
                                                 ic_r.center(),
                                                 11.5,
-                                                Color32::from_rgba_unmultiplied(
-                                                    sc.r(),
-                                                    sc.g(),
-                                                    sc.b(),
-                                                    if focused { 105 } else { 46 },
-                                                ),
+                                                if focused {
+                                                    Color32::from_rgba_unmultiplied(255, 255, 255, 32)
+                                                } else {
+                                                    Color32::from_rgba_unmultiplied(255, 255, 255, 16)
+                                                },
                                             );
-                                            Self::draw_setting_icon(
-                                                ui.painter(),
-                                                ic_r.center(),
-                                                *icon_id,
-                                                if focused { Color32::WHITE } else { sc },
-                                            );
+                                            Self::draw_setting_icon(ui.painter(), ic_r.center(), *icon_id, sc);
                                             ui.add_space(4.0);
                                             ui.label(
                                                 RichText::new(*label)
@@ -5700,19 +5658,13 @@ impl AstryxTvApp {
                                         ui.painter().circle_filled(
                                             ir.center(),
                                             12.5,
-                                            Color32::from_rgba_unmultiplied(
-                                                sc.r(),
-                                                sc.g(),
-                                                sc.b(),
-                                                if focused { 105 } else { 46 },
-                                            ),
+                                            if focused {
+                                                Color32::from_rgba_unmultiplied(255, 255, 255, 32)
+                                            } else {
+                                                Color32::from_rgba_unmultiplied(255, 255, 255, 16)
+                                            },
                                         );
-                                        Self::draw_setting_icon(
-                                            ui.painter(),
-                                            ir.center(),
-                                            *icon_id,
-                                            if focused { Color32::WHITE } else { sc },
-                                        );
+                                        Self::draw_setting_icon(ui.painter(), ir.center(), *icon_id, sc);
                                         ui.add_space(6.0);
                                         ui.vertical(|ui| {
                                             ui.spacing_mut().item_spacing.y = 0.0;
@@ -6297,9 +6249,13 @@ impl AstryxTvApp {
                                         ui.painter().circle_filled(
                                             ir.center(),
                                             12.5,
-                                            Color32::from_rgba_unmultiplied(sc.r(), sc.g(), sc.b(), if focused { 105 } else { 46 }),
+                                            if focused {
+                                                Color32::from_rgba_unmultiplied(255, 255, 255, 32)
+                                            } else {
+                                                Color32::from_rgba_unmultiplied(255, 255, 255, 16)
+                                            },
                                         );
-                                        Self::draw_setting_icon(ui.painter(), ir.center(), *ic, if focused { Color32::WHITE } else { sc });
+                                        Self::draw_setting_icon(ui.painter(), ir.center(), *ic, sc);
                                         ui.add_space(6.0);
                                         ui.vertical(|ui| {
                                             ui.label(RichText::new(*title).font(FontId::proportional(14.0)).strong().color(Color32::WHITE));
