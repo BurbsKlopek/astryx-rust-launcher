@@ -203,6 +203,14 @@ pub struct LauncherConfig {
     pub onboarding_done: bool,
     #[serde(default)]
     pub show_fps_meter: bool,
+    #[serde(default = "default_true")]
+    pub overlay_show_fps: bool,
+    #[serde(default = "default_true")]
+    pub overlay_show_hz: bool,
+    #[serde(default = "default_true")]
+    pub overlay_show_net: bool,
+    #[serde(default)]
+    pub overlay_show_ram: bool,
     pub icon_size: IconSize,
     pub sort_order: SortOrder,
     pub show_header: bool,
@@ -238,6 +246,10 @@ impl Default for LauncherConfig {
             auto_night_dim: true,
             onboarding_done: false,
             show_fps_meter: false,
+            overlay_show_fps: true,
+            overlay_show_hz: true,
+            overlay_show_net: true,
+            overlay_show_ram: false,
             icon_size: IconSize::Standard,
             sort_order: SortOrder::Alpha,
             show_header: true,
@@ -293,5 +305,22 @@ impl LauncherConfig {
             232
         };
         Color32::from_rgba_unmultiplied(r, g, b, alpha)
+    }
+
+    pub fn overlay_flags(&self) -> i32 {
+        let mut f = 0;
+        if self.overlay_show_fps {
+            f |= 1;
+        }
+        if self.overlay_show_hz {
+            f |= 2;
+        }
+        if self.overlay_show_net {
+            f |= 4;
+        }
+        if self.overlay_show_ram {
+            f |= 8;
+        }
+        f
     }
 }

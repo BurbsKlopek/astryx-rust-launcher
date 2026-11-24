@@ -142,9 +142,11 @@ class RustLauncherActivity : NativeActivity() {
         return activeRefreshRateHz
     }
 
-    fun rustSetFpsOverlay(enabled: Boolean): String {
+    fun rustSetFpsOverlay(enabled: Boolean, flags: Int): String {
         return try {
-            val svcIntent = Intent(this, FpsOverlayService::class.java)
+            val svcIntent = Intent(this, FpsOverlayService::class.java).apply {
+                putExtra(FpsOverlayService.EXTRA_FLAGS, flags)
+            }
             if (!enabled) {
                 stopService(svcIntent)
                 return "OFF"

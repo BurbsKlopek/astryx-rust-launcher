@@ -322,14 +322,14 @@ pub fn get_refresh_rate() -> f32 {
     .unwrap_or(60.0)
 }
 
-pub fn set_fps_overlay(enabled: bool) -> String {
+pub fn set_fps_overlay(enabled: bool, flags: i32) -> String {
     with_activity(|env, act| {
         let val = env
             .call_method(
                 act,
                 "rustSetFpsOverlay",
-                "(Z)Ljava/lang/String;",
-                &[JValue::Bool(u8::from(enabled))],
+                "(ZI)Ljava/lang/String;",
+                &[JValue::Bool(u8::from(enabled)), JValue::Int(flags)],
             )
             .ok()?
             .l()

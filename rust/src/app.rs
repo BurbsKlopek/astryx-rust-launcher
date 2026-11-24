@@ -69,6 +69,7 @@ enum ActiveModal {
     Theme,
     Settings,
     Updater,
+    Overlay,
     Search,
     A2ui,
     AppContext(String), // package_name
@@ -257,7 +258,8 @@ impl AstryxTvApp {
         app.ensure_wallpaper(cc.egui_ctx.clone());
         app.spawn_check_update(cc.egui_ctx.clone(), true);
         if app.config.show_fps_meter {
-            app.fps_overlay_active = bridge::set_fps_overlay(true) == "ON";
+            app.fps_overlay_active =
+                bridge::set_fps_overlay(true, app.config.overlay_flags()) == "ON";
         }
         app
     }
@@ -3564,21 +3566,7 @@ impl AstryxTvApp {
                         }
                     }
                     15 => {
-                        this.config.show_fps_meter = !this.config.show_fps_meter;
-                        this.fps_frame_count = 0;
-                        this.fps_window_start = Instant::now();
-                        this.save_config();
-                        let res = bridge::set_fps_overlay(this.config.show_fps_meter);
-                        this.fps_overlay_active = res == "ON";
-                        if this.config.show_fps_meter {
-                            if res == "ON" {
-                                this.show_toast("FPS Overlay ON (visible across all apps)");
-                            } else if res == "NEED_PERMISSION" {
-                                this.show_toast("Allow 'Display over other apps' for cross-app FPS overlay");
-                            }
-                        } else {
-                            this.show_toast("FPS Overlay OFF");
-                        }
+                        this.open_modal(ActiveModal::Overlay);
                     }
                     _ => {}
                 };
@@ -3803,8 +3791,12 @@ impl AstryxTvApp {
                                 13,
                             ),
                             (
-                                "FPS Meter",
-                                if this.config.show_fps_meter { "ON" } else { "OFF" }.to_string(),
+                                "HUD Overlay",
+                                if this.config.show_fps_meter {
+                                    "ON ›".to_string()
+                                } else {
+                                    "OFF ›".to_string()
+                                },
                                 this.config.show_fps_meter,
                                 14,
                             ),
@@ -4925,6 +4917,291 @@ impl AstryxTvApp {
                     }
                 }
             }
+
+            ActiveModal::Overlay => {
+                const ROW_COUNT: usize = 5;
+                let mut trigger = false;
+                if allow_keys {
+                    ctx.input(|i| {
+                        if i.key_pressed(Key::ArrowDown) {
+                            self.modal_focus = (self.modal_focus + 1).min(ROW_COUNT - 1);
+                            self.modal_focus_changed = true;
+                        } else if i.key_pressed(Key::ArrowUp) {
+                            self.modal_focus = self.modal_focus.saturating_sub(1);
+                            self.modal_focus_changed = true;
+                        } else if i.key_pressed(Key::Enter)
+                            || i.key_pressed(Key::Space)
+                            || i.key_pressed(Key::ArrowLeft)
+                            || i.key_pressed(Key::ArrowRight)
+                        {
+                            trigger = true;
+                        }
+                    });
+                }
+
+                let apply_overlay_row = |this: &mut Self, idx: usize| {
+                    match idx {
+                        0 => this.config.show_fps_meter = !this.config.show_fps_meter,
+                        1 => this.config.overlay_show_fps = !this.config.overlay_show_fps,
+                        2 => this.config.overlay_show_hz = !this.config.overlay_show_hz,
+                        3 => this.config.overlay_show_net = !this.config.overlay_show_net,
+                        4 => this.config.overlay_show_ram = !this.config.overlay_show_ram,
+                        _ => {}
+                    }
+                    this.fps_frame_count = 0;
+                    this.fps_window_start = Instant::now();
+                    this.save_config();
+                    let res =
+                        bridge::set_fps_overlay(this.config.show_fps_meter, this.config.overlay_flags());
+                    this.fps_overlay_active = res == "ON";
+                    if idx == 0 {
+                        if this.config.show_fps_meter {
+                            if res == "ON" {
+                                this.show_toast("HUD Overlay ON (visible across all apps)");
+                            } else if res == "NEED_PERMISSION" {
+                                this.show_toast(
+                                    "Allow 'Display over other apps' for cross-app HUD overlay",
+                                );
+                            }
+                        } else {
+                            this.show_toast("HUD Overlay OFF");
+                        }
+                    }
+                };
+
+                if trigger {
+                    apply_overlay_row(self, self.modal_focus);
+                }
+
+                self.draw_modal_shell(
+                    ctx,
+                    "HUD Overlay  ·  Up/Down move · OK toggle · BACK Settings",
+                    640.0,
+                    395.0,
+                    |this, ui, _ctx| {
+                        let accent = this.config.accent();
+
+                        // Live Pill Preview
+                        let mut preview_parts: Vec<String> = Vec::new();
+                        if this.config.overlay_show_fps {
+                            preview_parts.push(format!("{} FPS", this.fps_current.round() as u32));
+                        }
+                        if this.config.overlay_show_hz {
+                            preview_parts.push(format!("{:.0}Hz", this.display_hz));
+                        }
+                        if this.config.overlay_show_net {
+                            preview_parts.push("↓ 8.4 MB/s".to_string());
+                        }
+                        if this.config.overlay_show_ram {
+                            preview_parts.push(format!("RAM {} MB", this.status.ram_free_mb));
+                        }
+                        let preview_txt = if !this.config.show_fps_meter {
+                            "Overlay Disabled".to_string()
+                        } else if preview_parts.is_empty() {
+                            "All measurements hidden".to_string()
+                        } else {
+                            preview_parts.join("  ·  ")
+                        };
+
+                        ui.vertical_centered(|ui| {
+                            egui::Frame::NONE
+                                .fill(Color32::from_rgba_unmultiplied(12, 16, 28, 224))
+                                .stroke(Stroke::new(
+                                    1.2_f32,
+                                    if this.config.show_fps_meter {
+                                        accent
+                                    } else {
+                                        Color32::from_rgba_unmultiplied(255, 255, 255, 36)
+                                    },
+                                ))
+                                .corner_radius(CornerRadius::same(18))
+                                .inner_margin(egui::Margin::symmetric(16, 7))
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 7.0;
+                                        let (dr, _) =
+                                            ui.allocate_exact_size(Vec2::splat(8.0), Sense::hover());
+                                        ui.painter().circle_filled(
+                                            dr.center(),
+                                            3.6,
+                                            if this.config.show_fps_meter {
+                                                Color32::from_rgb(52, 211, 153)
+                                            } else {
+                                                Color32::from_rgb(120, 132, 154)
+                                            },
+                                        );
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(preview_txt)
+                                                    .font(FontId::proportional(12.5))
+                                                    .strong()
+                                                    .color(Color32::WHITE),
+                                            )
+                                            .extend(),
+                                        );
+                                    });
+                                });
+                        });
+
+                        ui.add_space(12.0);
+
+                        let items: [(&str, &str, bool, usize); ROW_COUNT] = [
+                            (
+                                "Cross-App HUD Overlay",
+                                "Floating top-center pill over launcher & all apps",
+                                this.config.show_fps_meter,
+                                14,
+                            ),
+                            (
+                                "Live FPS",
+                                "Real-time frame rate counter",
+                                this.config.overlay_show_fps,
+                                14,
+                            ),
+                            (
+                                "Screen Refresh Rate",
+                                "Active TV display refresh rate (Hz)",
+                                this.config.overlay_show_hz,
+                                100,
+                            ),
+                            (
+                                "Network Activity",
+                                "Live download & upload speed (KB/s · MB/s)",
+                                this.config.overlay_show_net,
+                                200,
+                            ),
+                            (
+                                "Free Memory (RAM)",
+                                "Available system RAM in MB",
+                                this.config.overlay_show_ram,
+                                101,
+                            ),
+                        ];
+
+                        let mut clicked: Option<usize> = None;
+                        for (idx, (title, sub, is_on, icon_id)) in items.iter().enumerate() {
+                            let focused = this.modal_focus == idx;
+                            let resp = egui::Frame::NONE
+                                .fill(if focused {
+                                    Color32::from_rgba_unmultiplied(
+                                        accent.r(),
+                                        accent.g(),
+                                        accent.b(),
+                                        44,
+                                    )
+                                } else {
+                                    Color32::from_rgba_unmultiplied(255, 255, 255, 10)
+                                })
+                                .stroke(if focused {
+                                    Stroke::new(1.8_f32, accent)
+                                } else {
+                                    Stroke::new(
+                                        1.0_f32,
+                                        Color32::from_rgba_unmultiplied(255, 255, 255, 18),
+                                    )
+                                })
+                                .corner_radius(CornerRadius::same(12))
+                                .inner_margin(egui::Margin::symmetric(14, 7))
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        let (ir, _) = ui.allocate_exact_size(
+                                            Vec2::splat(26.0),
+                                            Sense::hover(),
+                                        );
+                                        ui.painter().circle_filled(
+                                            ir.center(),
+                                            12.5,
+                                            if focused {
+                                                Color32::from_rgba_unmultiplied(
+                                                    accent.r(),
+                                                    accent.g(),
+                                                    accent.b(),
+                                                    78,
+                                                )
+                                            } else {
+                                                Color32::from_rgba_unmultiplied(255, 255, 255, 18)
+                                            },
+                                        );
+                                        Self::draw_setting_icon(
+                                            ui.painter(),
+                                            ir.center(),
+                                            *icon_id,
+                                            if focused {
+                                                Color32::WHITE
+                                            } else {
+                                                Color32::from_rgb(205, 220, 242)
+                                            },
+                                        );
+                                        ui.add_space(6.0);
+                                        ui.vertical(|ui| {
+                                            ui.spacing_mut().item_spacing.y = 0.0;
+                                            ui.label(
+                                                RichText::new(*title)
+                                                    .font(FontId::proportional(13.5))
+                                                    .strong()
+                                                    .color(Color32::WHITE),
+                                            );
+                                            ui.label(
+                                                RichText::new(*sub)
+                                                    .font(FontId::proportional(10.5))
+                                                    .color(Color32::from_rgb(172, 188, 214)),
+                                            );
+                                        });
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(Align::Center),
+                                            |ui| {
+                                                egui::Frame::NONE
+                                                    .fill(if *is_on {
+                                                        Color32::from_rgba_unmultiplied(
+                                                            52, 211, 153, 55,
+                                                        )
+                                                    } else {
+                                                        Color32::from_rgba_unmultiplied(
+                                                            255, 255, 255, 16,
+                                                        )
+                                                    })
+                                                    .stroke(Stroke::new(
+                                                        1.0_f32,
+                                                        if *is_on {
+                                                            Color32::from_rgb(52, 211, 153)
+                                                        } else {
+                                                            Color32::from_rgba_unmultiplied(
+                                                                255, 255, 255, 36,
+                                                            )
+                                                        },
+                                                    ))
+                                                    .corner_radius(CornerRadius::same(8))
+                                                    .inner_margin(egui::Margin::symmetric(12, 4))
+                                                    .show(ui, |ui| {
+                                                        ui.label(
+                                                            RichText::new(if *is_on {
+                                                                "ON"
+                                                            } else {
+                                                                "OFF"
+                                                            })
+                                                            .font(FontId::proportional(11.5))
+                                                            .strong()
+                                                            .color(Color32::WHITE),
+                                                        );
+                                                    });
+                                            },
+                                        );
+                                    });
+                                })
+                                .response;
+                            if resp.clicked() {
+                                this.modal_focus = idx;
+                                clicked = Some(idx);
+                            }
+                            ui.add_space(5.0);
+                        }
+
+                        if let Some(c) = clicked {
+                            apply_overlay_row(this, c);
+                        }
+                    },
+                );
+            }
         }
     }
     fn draw_zenith_home(&mut self, ctx: &egui::Context, visible: &[TvAppInfo]) {
@@ -5659,7 +5936,7 @@ impl eframe::App for AstryxTvApp {
         self.render_modals(ctx, &visible);
 
         // In-launcher FPS Meter Pill fallback (only shown if system-wide overlay isn't active yet)
-        if self.config.show_fps_meter && !self.fps_overlay_active {
+        if self.config.show_fps_meter && !self.fps_overlay_active && self.config.overlay_flags() != 0 {
             self.fps_frame_count = self.fps_frame_count.saturating_add(1);
             let win_s = self.fps_window_start.elapsed().as_secs_f32();
             if win_s >= 0.45 {
@@ -5670,12 +5947,30 @@ impl eframe::App for AstryxTvApp {
             ctx.request_repaint();
 
             let fps_val = self.fps_current.round() as u32;
-            let dot_c = if self.fps_current >= (self.display_hz - 5.0).max(52.0) {
+            let dot_c = if !self.config.overlay_show_fps {
+                Color32::from_rgb(56, 189, 248)
+            } else if self.fps_current >= (self.display_hz - 5.0).max(52.0) {
                 Color32::from_rgb(52, 211, 153)
             } else if self.fps_current >= 35.0 {
                 Color32::from_rgb(251, 191, 36)
             } else {
                 Color32::from_rgb(248, 113, 113)
+            };
+
+            let mut parts: Vec<String> = Vec::new();
+            if self.config.overlay_show_fps {
+                parts.push(format!("{fps_val} FPS"));
+            }
+            if self.config.overlay_show_hz {
+                parts.push(format!("{:.0}Hz", self.display_hz));
+            }
+            if self.config.overlay_show_ram {
+                parts.push(format!("RAM {} MB", self.status.ram_free_mb));
+            }
+            let hud_txt = if parts.is_empty() {
+                "HUD LIVE".to_string()
+            } else {
+                parts.join("  ·  ")
             };
 
             egui::Area::new(egui::Id::new("fps_meter_pill"))
@@ -5699,13 +5994,10 @@ impl eframe::App for AstryxTvApp {
                                 ui.painter().circle_filled(dr.center(), 3.2, dot_c);
                                 ui.add(
                                     egui::Label::new(
-                                        RichText::new(format!(
-                                            "{fps_val} FPS · {:.0}Hz",
-                                            self.display_hz
-                                        ))
-                                        .font(FontId::proportional(11.5))
-                                        .strong()
-                                        .color(Color32::WHITE),
+                                        RichText::new(hud_txt)
+                                            .font(FontId::proportional(11.5))
+                                            .strong()
+                                            .color(Color32::WHITE),
                                     )
                                     .extend(),
                                 );
