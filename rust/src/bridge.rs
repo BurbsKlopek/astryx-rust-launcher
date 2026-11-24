@@ -36,6 +36,7 @@ static ANDROID_HANDLES: OnceLock<(usize, usize)> = OnceLock::new();
 static EGUI_CTX: OnceLock<egui::Context> = OnceLock::new();
 static BACK_PRESSED: AtomicBool = AtomicBool::new(false);
 static MENU_PRESSED: AtomicBool = AtomicBool::new(false);
+static STATUS_REFRESH_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 pub fn init(vm_ptr: *mut c_void, activity_ptr: *mut c_void) {
     let _ = ANDROID_HANDLES.set((vm_ptr as usize, activity_ptr as usize));
@@ -51,6 +52,10 @@ pub fn take_back_pressed() -> bool {
 
 pub fn take_menu_pressed() -> bool {
     MENU_PRESSED.swap(false, Ordering::SeqCst)
+}
+
+pub fn take_status_refresh_requested() -> bool {
+    STATUS_REFRESH_REQUESTED.swap(false, Ordering::SeqCst)
 }
 
 #[no_mangle]
@@ -70,6 +75,17 @@ pub extern "system" fn Java_com_astryxtv_rustlauncher_RustLauncherActivity_nativ
     _obj: JObject,
 ) {
     MENU_PRESSED.store(true, Ordering::SeqCst);
+    if let Some(ctx) = EGUI_CTX.get() {
+        ctx.request_repaint();
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_astryxtv_rustlauncher_RustLauncherActivity_nativeOnStatusChanged(
+    _env: jni::JNIEnv,
+    _obj: JObject,
+) {
+    STATUS_REFRESH_REQUESTED.store(true, Ordering::SeqCst);
     if let Some(ctx) = EGUI_CTX.get() {
         ctx.request_repaint();
     }

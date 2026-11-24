@@ -2003,7 +2003,7 @@ impl AstryxTvApp {
                 }
             }
             1 => {
-                // VPN shield
+                // VPN shield (subtle tinted fill + bold outline for clear green/red visibility)
                 let pts = vec![
                     center + Vec2::new(0.0, -7.5),
                     center + Vec2::new(6.5, -4.5),
@@ -2012,7 +2012,12 @@ impl AstryxTvApp {
                     center + Vec2::new(-5.5, 2.5),
                     center + Vec2::new(-6.5, -4.5),
                 ];
-                painter.add(egui::Shape::closed_line(pts, s));
+                painter.add(egui::Shape::convex_polygon(
+                    pts.clone(),
+                    Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 72),
+                    Stroke::NONE,
+                ));
+                painter.add(egui::Shape::closed_line(pts, Stroke::new(2.0_f32, color)));
             }
             2 => {
                 // Search magnifier
@@ -7189,8 +7194,10 @@ impl eframe::App for AstryxTvApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_messages(ctx);
 
-        // Periodic background refreshes
-        if self.last_status_poll.elapsed() > Duration::from_secs(20) {
+        // Instant refresh on network/VPN change or Activity resume + 3s fallback poll
+        if bridge::take_status_refresh_requested()
+            || self.last_status_poll.elapsed() > Duration::from_secs(3)
+        {
             self.spawn_load_status(ctx.clone());
         }
         if self.last_weather_poll.elapsed() > Duration::from_secs(900) {

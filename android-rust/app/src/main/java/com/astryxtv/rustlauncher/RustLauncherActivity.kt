@@ -19,7 +19,9 @@ import android.graphics.Canvas
 import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.Drawable
 import android.net.ConnectivityManager
+import android.net.Network
 import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -48,6 +50,16 @@ class RustLauncherActivity : NativeActivity() {
 
     private external fun nativeOnBackPressed()
     private external fun nativeOnMenuPressed()
+    private external fun nativeOnStatusChanged()
+
+    private var netCallback: ConnectivityManager.NetworkCallback? = null
+
+    private fun notifyStatusChanged() {
+        try {
+            nativeOnStatusChanged()
+        } catch (_: UnsatisfiedLinkError) {
+        }
+    }
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
         if (event.keyCode == KeyEvent.KEYCODE_BACK) {
@@ -85,6 +97,50 @@ class RustLauncherActivity : NativeActivity() {
         super.onCreate(savedInstanceState)
         prefer4kHighRefreshDisplayMode()
         enterImmersiveMode()
+        registerNetworkWatcher()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        notifyStatusChanged()
+    }
+
+    override fun onDestroy() {
+        unregisterNetworkWatcher()
+        super.onDestroy()
+    }
+
+    private fun registerNetworkWatcher() {
+        try {
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            val req = NetworkRequest.Builder()
+                .removeCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+                .build()
+            val cb = object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: Network) {
+                    notifyStatusChanged()
+                }
+                override fun onLost(network: Network) {
+                    notifyStatusChanged()
+                }
+                override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
+                    notifyStatusChanged()
+                }
+            }
+            cm.registerNetworkCallback(req, cb)
+            netCallback = cb
+        } catch (_: Throwable) {
+        }
+    }
+
+    private fun unregisterNetworkWatcher() {
+        try {
+            val cb = netCallback ?: return
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            cm.unregisterNetworkCallback(cb)
+            netCallback = null
+        } catch (_: Throwable) {
+        }
     }
 
     override fun surfaceCreated(holder: SurfaceHolder) {
@@ -178,7 +234,10 @@ class RustLauncherActivity : NativeActivity() {
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
-        if (hasFocus) enterImmersiveMode()
+        if (hasFocus) {
+            enterImmersiveMode()
+            notifyStatusChanged()
+        }
     }
 
     @Suppress("DEPRECATION")
