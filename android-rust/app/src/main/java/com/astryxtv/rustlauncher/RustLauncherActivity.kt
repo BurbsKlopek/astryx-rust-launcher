@@ -142,6 +142,35 @@ class RustLauncherActivity : NativeActivity() {
         return activeRefreshRateHz
     }
 
+    fun rustSetFpsOverlay(enabled: Boolean): String {
+        return try {
+            val svcIntent = Intent(this, FpsOverlayService::class.java)
+            if (!enabled) {
+                stopService(svcIntent)
+                return "OFF"
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(this)) {
+                try {
+                    val permIntent = Intent(
+                        Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                        Uri.parse("package:$packageName")
+                    ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    startActivity(permIntent)
+                } catch (_: Throwable) {
+                }
+                return "NEED_PERMISSION"
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(svcIntent)
+            } else {
+                startService(svcIntent)
+            }
+            "ON"
+        } catch (t: Throwable) {
+            "ERR:${t.message ?: t.javaClass.simpleName}"
+        }
+    }
+
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
         if (hasFocus) enterImmersiveMode()

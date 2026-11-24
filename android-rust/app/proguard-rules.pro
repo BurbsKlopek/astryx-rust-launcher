@@ -5,3 +5,6 @@
 -keep class com.astryxtv.rustlauncher.UpdateInstallReceiver {
     *;
 }
+-keep class com.astryxtv.rustlauncher.FpsOverlayService {
+    *;
+}

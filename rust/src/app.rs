@@ -106,6 +106,7 @@ pub struct AstryxTvApp {
     fps_frame_count: u32,
     fps_window_start: Instant,
     fps_current: f32,
+    fps_overlay_active: bool,
     updater_state: UpdaterState,
 
     // Navigation & Modals
@@ -217,6 +218,7 @@ impl AstryxTvApp {
             fps_frame_count: 0,
             fps_window_start: now,
             fps_current: 60.0,
+            fps_overlay_active: false,
             updater_state: UpdaterState::Idle,
             focus: FocusTarget::App(0),
             last_app_idx: 0,
@@ -254,6 +256,9 @@ impl AstryxTvApp {
         app.spawn_load_weather(cc.egui_ctx.clone());
         app.ensure_wallpaper(cc.egui_ctx.clone());
         app.spawn_check_update(cc.egui_ctx.clone(), true);
+        if app.config.show_fps_meter {
+            app.fps_overlay_active = bridge::set_fps_overlay(true) == "ON";
+        }
         app
     }
 
@@ -3563,6 +3568,17 @@ impl AstryxTvApp {
                         this.fps_frame_count = 0;
                         this.fps_window_start = Instant::now();
                         this.save_config();
+                        let res = bridge::set_fps_overlay(this.config.show_fps_meter);
+                        this.fps_overlay_active = res == "ON";
+                        if this.config.show_fps_meter {
+                            if res == "ON" {
+                                this.show_toast("FPS Overlay ON (visible across all apps)");
+                            } else if res == "NEED_PERMISSION" {
+                                this.show_toast("Allow 'Display over other apps' for cross-app FPS overlay");
+                            }
+                        } else {
+                            this.show_toast("FPS Overlay OFF");
+                        }
                     }
                     _ => {}
                 };
@@ -5642,8 +5658,8 @@ impl eframe::App for AstryxTvApp {
         // Active modal overlay
         self.render_modals(ctx, &visible);
 
-        // Live FPS Meter Pill (top-right, when enabled in Settings → System & Updates → FPS Meter)
-        if self.config.show_fps_meter {
+        // In-launcher FPS Meter Pill fallback (only shown if system-wide overlay isn't active yet)
+        if self.config.show_fps_meter && !self.fps_overlay_active {
             self.fps_frame_count = self.fps_frame_count.saturating_add(1);
             let win_s = self.fps_window_start.elapsed().as_secs_f32();
             if win_s >= 0.45 {

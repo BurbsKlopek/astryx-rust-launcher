@@ -7,6 +7,9 @@
     <uses-permission android:name="android.permission.REQUEST_DELETE_PACKAGES" />
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
     <uses-permission android:name="android.permission.KILL_BACKGROUND_PROCESSES" />
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
 
     <uses-feature
         android:name="android.software.leanback"
@@ -50,6 +53,15 @@
         <receiver
             android:name=".UpdateInstallReceiver"
             android:exported="false" />
+
+        <service
+            android:name=".FpsOverlayService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Live FPS performance overlay pill for Android TV" />
+        </service>
 
     </application>
 </manifest>
