@@ -2320,30 +2320,38 @@ impl AstryxTvApp {
                             );
                             ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                                 let close_focused = self.modal_close_focused;
-                                let close_fill = if close_focused {
-                                    accent
-                                } else {
-                                    Color32::from_rgba_unmultiplied(255, 255, 255, 22)
-                                };
-                                let close_stroke = if close_focused {
-                                    Stroke::new(2.0_f32, Color32::WHITE)
-                                } else {
-                                    Stroke::new(1.0_f32, accent)
-                                };
-                                if ui
-                                    .add(
-                                        egui::Button::new(
-                                            RichText::new("✕ Close")
-                                                .font(FontId::proportional(13.0))
-                                                .strong()
-                                                .color(Color32::WHITE),
-                                        )
-                                        .fill(close_fill)
-                                        .stroke(close_stroke)
-                                        .corner_radius(CornerRadius::same(10)),
-                                    )
-                                    .clicked()
-                                {
+                                let (cr, resp) =
+                                    ui.allocate_exact_size(Vec2::splat(28.0), Sense::click());
+                                let p = ui.painter();
+                                let c = cr.center();
+                                p.circle_filled(
+                                    c,
+                                    13.5,
+                                    if close_focused {
+                                        accent
+                                    } else {
+                                        Color32::from_rgba_unmultiplied(255, 255, 255, 22)
+                                    },
+                                );
+                                p.circle_stroke(
+                                    c,
+                                    13.5,
+                                    if close_focused {
+                                        Stroke::new(2.0_f32, Color32::WHITE)
+                                    } else {
+                                        Stroke::new(1.0_f32, accent)
+                                    },
+                                );
+                                let x_s = Stroke::new(2.0_f32, Color32::WHITE);
+                                p.line_segment(
+                                    [c + Vec2::new(-4.5, -4.5), c + Vec2::new(4.5, 4.5)],
+                                    x_s,
+                                );
+                                p.line_segment(
+                                    [c + Vec2::new(4.5, -4.5), c + Vec2::new(-4.5, 4.5)],
+                                    x_s,
+                                );
+                                if resp.clicked() {
                                     self.close_modal_step();
                                 }
                             });
