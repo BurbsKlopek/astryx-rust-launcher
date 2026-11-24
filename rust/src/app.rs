@@ -102,6 +102,7 @@ pub struct AstryxTvApp {
 
     // Internal OTA Updater
     app_version: String,
+    display_hz: f32,
     updater_state: UpdaterState,
 
     // Navigation & Modals
@@ -209,6 +210,7 @@ impl AstryxTvApp {
             a2ui_input: SAMPLE_A2UI_PAYLOAD.to_string(),
             a2ui_feedback: String::new(),
             app_version: bridge::get_app_version(),
+            display_hz: bridge::get_refresh_rate(),
             updater_state: UpdaterState::Idle,
             focus: FocusTarget::App(0),
             last_app_idx: 0,
@@ -1131,7 +1133,8 @@ impl AstryxTvApp {
                         Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), a),
                     ),
                 );
-                ctx.request_repaint_after(Duration::from_millis(33));
+                // Native VSync pacing (60fps on 60Hz / 120fps on 120Hz displays)
+                ctx.request_repaint();
             }
             FocusAnimStyle::MagneticWave | FocusAnimStyle::Minimal => {}
         }
@@ -1312,15 +1315,18 @@ impl AstryxTvApp {
                             Stroke::new(1.8_f32, Color32::from_rgba_unmultiplied(230, 245, 255, a)),
                         );
                     }
-                    ctx.request_repaint_after(Duration::from_millis(33));
+                    // Full native VSync (60Hz / 120Hz) for buttery shooting stars & sky drift
+                    ctx.request_repaint();
                 } else {
-                    ctx.request_repaint_after(Duration::from_millis(80));
+                    let subsec_ms = Local::now().timestamp_subsec_millis().min(999) as u64;
+                    let wait_ms = (1000 - subsec_ms).max(16);
+                    ctx.request_repaint_after(Duration::from_millis(wait_ms));
                 }
             }
             _ => {
-                // Smooth low-CPU cinematic UV sky drift (no hard-edged overlays)
+                // Smooth native-VSync cinematic UV sky drift when motion is on; 1Hz sleep when idle
                 if motion {
-                    ctx.request_repaint_after(Duration::from_millis(80));
+                    ctx.request_repaint();
                 } else {
                     let subsec_ms = Local::now().timestamp_subsec_millis().min(999) as u64;
                     let wait_ms = (1000 - subsec_ms).max(16);
@@ -2737,7 +2743,8 @@ impl AstryxTvApp {
                                             Color32::WHITE,
                                         );
                                     }
-                                    ctx.request_repaint_after(Duration::from_millis(24));
+                                    // Full native VSync (60/120Hz) while previewing animations on First Launch
+                                    ctx.request_repaint();
                                 });
                             });
 
@@ -3631,7 +3638,10 @@ impl AstryxTvApp {
                                 &mut cols[0],
                                 100,
                                 "DEVICE",
-                                format!("{} · Android {}", this.status.device_model, this.status.android_version),
+                                format!(
+                                    "{} · Android {} · {:.0}Hz",
+                                    this.status.device_model, this.status.android_version, this.display_hz
+                                ),
                                 None,
                                 accent,
                             );

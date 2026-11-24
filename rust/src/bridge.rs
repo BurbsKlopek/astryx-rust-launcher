@@ -311,6 +311,17 @@ pub fn get_app_version() -> String {
     .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string())
 }
 
+pub fn get_refresh_rate() -> f32 {
+    with_activity(|env, act| {
+        env.call_method(act, "rustGetRefreshRate", "()F", &[])
+            .ok()?
+            .f()
+            .ok()
+    })
+    .filter(|hz| *hz >= 50.0 && *hz <= 240.0)
+    .unwrap_or(60.0)
+}
+
 pub fn get_cache_dir() -> String {
     with_activity(|env, act| {
         let val = env

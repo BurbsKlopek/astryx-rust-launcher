@@ -24,6 +24,8 @@ import android.os.Environment
 import android.os.StatFs
 import android.provider.Settings
 import android.view.KeyEvent
+import android.view.Surface
+import android.view.SurfaceHolder
 import android.view.View
 import org.json.JSONArray
 import org.json.JSONObject
@@ -74,27 +76,70 @@ class RustLauncherActivity : NativeActivity() {
         }
     }
 
+    private var activeRefreshRateHz: Float = 60f
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        prefer4k60DisplayMode()
+        prefer4kHighRefreshDisplayMode()
         enterImmersiveMode()
     }
 
-    private fun prefer4k60DisplayMode() {
+    override fun surfaceCreated(holder: SurfaceHolder) {
+        super.surfaceCreated(holder)
+        applySurfaceFrameRate(holder)
+    }
+
+    private fun applySurfaceFrameRate(holder: SurfaceHolder) {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                val targetHz = activeRefreshRateHz.coerceIn(60f, 120f)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    holder.surface.setFrameRate(
+                        targetHz,
+                        Surface.FRAME_RATE_COMPATIBILITY_DEFAULT,
+                        Surface.CHANGE_FRAME_RATE_ONLY_IF_SEAMLESS
+                    )
+                } else {
+                    holder.surface.setFrameRate(
+                        targetHz,
+                        Surface.FRAME_RATE_COMPATIBILITY_DEFAULT
+                    )
+                }
+            }
+        } catch (_: Throwable) {
+        }
+    }
+
+    private fun prefer4kHighRefreshDisplayMode() {
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 window.colorMode = android.content.pm.ActivityInfo.COLOR_MODE_WIDE_COLOR_GAMUT
             }
             val d = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) display else @Suppress("DEPRECATION") windowManager.defaultDisplay
-            val best = d?.supportedModes
+            val modes = d?.supportedModes
+            // Prefer highest resolution (4K), breaking ties with highest refresh rate up to 120Hz
+            val best = modes
+                ?.filter { it.refreshRate <= 121f }
                 ?.maxWithOrNull(compareBy<android.view.Display.Mode>({ it.physicalWidth * it.physicalHeight }, { it.refreshRate }))
+                ?: modes?.maxWithOrNull(compareBy<android.view.Display.Mode>({ it.physicalWidth * it.physicalHeight }, { it.refreshRate }))
             if (best != null) {
+                activeRefreshRateHz = best.refreshRate.coerceIn(60f, 120f)
                 val lp = window.attributes
                 lp.preferredDisplayModeId = best.modeId
+                lp.preferredRefreshRate = activeRefreshRateHz
+                window.attributes = lp
+            } else if (d != null) {
+                activeRefreshRateHz = d.refreshRate.coerceIn(60f, 120f)
+                val lp = window.attributes
+                lp.preferredRefreshRate = activeRefreshRateHz
                 window.attributes = lp
             }
         } catch (_: Throwable) {
         }
+    }
+
+    fun rustGetRefreshRate(): Float {
+        return activeRefreshRateHz
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
