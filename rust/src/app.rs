@@ -103,6 +103,9 @@ pub struct AstryxTvApp {
     // Internal OTA Updater
     app_version: String,
     display_hz: f32,
+    fps_frame_count: u32,
+    fps_window_start: Instant,
+    fps_current: f32,
     updater_state: UpdaterState,
 
     // Navigation & Modals
@@ -211,6 +214,9 @@ impl AstryxTvApp {
             a2ui_feedback: String::new(),
             app_version: bridge::get_app_version(),
             display_hz: bridge::get_refresh_rate(),
+            fps_frame_count: 0,
+            fps_window_start: now,
+            fps_current: 60.0,
             updater_state: UpdaterState::Idle,
             focus: FocusTarget::App(0),
             last_app_idx: 0,
@@ -1648,6 +1654,17 @@ impl AstryxTvApp {
                     ],
                     s,
                 ));
+            }
+            // FPS Meter: speedometer gauge arc + needle
+            14 => {
+                let mut pts = Vec::with_capacity(11);
+                for step in 0..=10 {
+                    let ang = std::f32::consts::PI * 0.85 + (step as f32 / 10.0) * std::f32::consts::PI * 1.3;
+                    pts.push(c + Vec2::new(ang.cos() * 5.4, ang.sin() * 5.4));
+                }
+                p.add(egui::Shape::line(pts, s));
+                p.line_segment([c + Vec2::new(0.0, 1.2), c + Vec2::new(3.6, -2.8)], Stroke::new(1.7_f32, color));
+                p.circle_filled(c + Vec2::new(0.0, 1.2), 1.4, color);
             }
             // Device / Display: TV monitor
             100 | 202 => {
@@ -3383,9 +3400,9 @@ impl AstryxTvApp {
             }
 
             ActiveModal::Settings => {
-                // 15 settings (0..15, perfect 5x3 grid!) + row 15 = Android TV Shortcuts (4 columns)
-                const SETTING_COUNT: usize = 15;
-                const SYS_IDX: usize = 15;
+                // 16 settings (0..16, 4 categories) + row 16 = Android TV Shortcuts (4 columns)
+                const SETTING_COUNT: usize = 16;
+                const SYS_IDX: usize = 16;
                 const GRID_COLS: usize = 3;
                 let is_grid = self.config.settings_view == SettingsViewMode::Grid;
 
@@ -3540,6 +3557,12 @@ impl AstryxTvApp {
                         ) {
                             this.spawn_check_update(ctx.clone(), false);
                         }
+                    }
+                    15 => {
+                        this.config.show_fps_meter = !this.config.show_fps_meter;
+                        this.fps_frame_count = 0;
+                        this.fps_window_start = Instant::now();
+                        this.save_config();
                     }
                     _ => {}
                 };
@@ -3762,6 +3785,12 @@ impl AstryxTvApp {
                                 },
                                 this.has_update_available(),
                                 13,
+                            ),
+                            (
+                                "FPS Meter",
+                                if this.config.show_fps_meter { "ON" } else { "OFF" }.to_string(),
+                                this.config.show_fps_meter,
+                                14,
                             ),
                         ];
 
@@ -5612,6 +5641,68 @@ impl eframe::App for AstryxTvApp {
 
         // Active modal overlay
         self.render_modals(ctx, &visible);
+
+        // Live FPS Meter Pill (top-right, when enabled in Settings → System & Updates → FPS Meter)
+        if self.config.show_fps_meter {
+            self.fps_frame_count = self.fps_frame_count.saturating_add(1);
+            let win_s = self.fps_window_start.elapsed().as_secs_f32();
+            if win_s >= 0.45 {
+                self.fps_current = (self.fps_frame_count as f32 / win_s).clamp(1.0, 240.0);
+                self.fps_frame_count = 0;
+                self.fps_window_start = Instant::now();
+            }
+            ctx.request_repaint();
+
+            let fps_val = self.fps_current.round() as u32;
+            let dot_c = if self.fps_current >= (self.display_hz - 5.0).max(52.0) {
+                Color32::from_rgb(52, 211, 153)
+            } else if self.fps_current >= 35.0 {
+                Color32::from_rgb(251, 191, 36)
+            } else {
+                Color32::from_rgb(248, 113, 113)
+            };
+
+            let is_zenith = self.config.layout_style == LayoutStyle::Zenith;
+            let fps_offset = if !is_zenith && self.config.show_header && self.config.show_weather {
+                Vec2::new(-336.0, 19.0)
+            } else if is_zenith && self.config.show_header {
+                Vec2::new(-28.0, 68.0)
+            } else {
+                Vec2::new(-28.0, 18.0)
+            };
+
+            egui::Area::new(egui::Id::new("fps_meter_pill"))
+                .anchor(Align2::RIGHT_TOP, fps_offset)
+                .order(egui::Order::Tooltip)
+                .interactable(false)
+                .show(ctx, |ui| {
+                    egui::Frame::NONE
+                        .fill(Color32::from_rgba_unmultiplied(12, 16, 28, 212))
+                        .stroke(Stroke::new(
+                            1.0_f32,
+                            Color32::from_rgba_unmultiplied(255, 255, 255, 42),
+                        ))
+                        .corner_radius(CornerRadius::same(16))
+                        .inner_margin(egui::Margin::symmetric(12, 5))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 6.0;
+                                let (dr, _) =
+                                    ui.allocate_exact_size(Vec2::splat(7.0), Sense::hover());
+                                ui.painter().circle_filled(dr.center(), 3.2, dot_c);
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(format!("{fps_val} FPS"))
+                                            .font(FontId::proportional(11.5))
+                                            .strong()
+                                            .color(Color32::WHITE),
+                                    )
+                                    .extend(),
+                                );
+                            });
+                        });
+                });
+        }
 
         // Toast notification (single-line auto-sized frosted pill, clear of top bar & bottom dock)
         if let Some((msg, at)) = &self.toast {

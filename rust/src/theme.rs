@@ -201,6 +201,8 @@ pub struct LauncherConfig {
     pub auto_night_dim: bool,
     #[serde(default)]
     pub onboarding_done: bool,
+    #[serde(default)]
+    pub show_fps_meter: bool,
     pub icon_size: IconSize,
     pub sort_order: SortOrder,
     pub show_header: bool,
@@ -235,6 +237,7 @@ impl Default for LauncherConfig {
             show_status_pill: true,
             auto_night_dim: true,
             onboarding_done: false,
+            show_fps_meter: false,
             icon_size: IconSize::Standard,
             sort_order: SortOrder::Alpha,
             show_header: true,
