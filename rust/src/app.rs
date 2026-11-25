@@ -1314,6 +1314,86 @@ impl AstryxTvApp {
         }
     }
 
+    fn resting_focus_motion(&self, focused: bool, focus_t: f32) -> (f32, f32) {
+        if !focused
+            || focus_t < 0.01
+            || self.config.lightweight_mode
+            || self.config.focus_anim == FocusAnimStyle::Minimal
+        {
+            return (0.0, 0.0);
+        }
+        let t = self.start_time.elapsed().as_secs_f32();
+        let wave = (t * 2.1).sin();
+        let float_y = wave * 2.4 * focus_t;
+        let breath = (wave * 0.5 + 0.5) * focus_t;
+        (float_y, breath)
+    }
+
+    fn draw_resting_focus_overlay(
+        &self,
+        ctx: &egui::Context,
+        p: &egui::Painter,
+        center: Pos2,
+        radius: f32,
+        focused: bool,
+        focus_t: f32,
+        accent: Color32,
+    ) {
+        if !focused
+            || focus_t < 0.01
+            || self.config.lightweight_mode
+            || self.config.focus_anim == FocusAnimStyle::Minimal
+        {
+            return;
+        }
+        let t = self.start_time.elapsed().as_secs_f32();
+        let base_ang = t * 1.45;
+        let rim_r = radius + 0.4;
+
+        // Primary liquid-glass specular comet arc orbiting the focused rim
+        const SEGS: usize = 10;
+        let sweep = 1.05_f32; // ~60 degrees
+        for i in 0..SEGS {
+            let f0 = i as f32 / SEGS as f32;
+            let f1 = (i + 1) as f32 / SEGS as f32;
+            let a0 = base_ang - sweep * (1.0 - f0);
+            let a1 = base_ang - sweep * (1.0 - f1);
+            let p0 = center + Vec2::new(a0.cos() * rim_r, a0.sin() * rim_r);
+            let p1 = center + Vec2::new(a1.cos() * rim_r, a1.sin() * rim_r);
+            // Smooth fade-in tail to crisp luminous specular head
+            let intensity = (f1 * f1) * focus_t;
+            let mix_white = f1.powf(1.6);
+            let r = (accent.r() as f32 * (1.0 - mix_white) + 255.0 * mix_white) as u8;
+            let g = (accent.g() as f32 * (1.0 - mix_white) + 255.0 * mix_white) as u8;
+            let b = (accent.b() as f32 * (1.0 - mix_white) + 255.0 * mix_white) as u8;
+            let alpha = (intensity * 235.0) as u8;
+            let width = (1.2 + f1 * 2.2) * focus_t;
+            p.line_segment(
+                [p0, p1],
+                Stroke::new(width, Color32::from_rgba_unmultiplied(r, g, b, alpha)),
+            );
+        }
+
+        // Subtle opposing refractive glass glint on the opposite rim
+        let opp_ang = base_ang + std::f32::consts::PI;
+        let opp_sweep = 0.55_f32;
+        for i in 0..5 {
+            let f0 = i as f32 / 5.0;
+            let f1 = (i + 1) as f32 / 5.0;
+            let a0 = opp_ang - opp_sweep * (1.0 - f0);
+            let a1 = opp_ang - opp_sweep * (1.0 - f1);
+            let p0 = center + Vec2::new(a0.cos() * rim_r, a0.sin() * rim_r);
+            let p1 = center + Vec2::new(a1.cos() * rim_r, a1.sin() * rim_r);
+            let alpha = (f1 * 95.0 * focus_t) as u8;
+            p.line_segment(
+                [p0, p1],
+                Stroke::new(1.6_f32 * focus_t, Color32::from_rgba_unmultiplied(255, 255, 255, alpha)),
+            );
+        }
+
+        ctx.request_repaint();
+    }
+
     fn draw_background(&self, ctx: &egui::Context, rect: Rect) {
         let painter = ctx.layer_painter(egui::LayerId::background());
         let scene = self.active_scene();
@@ -2399,26 +2479,40 @@ impl AstryxTvApp {
             focused,
             0.065,
         );
-        let center = Pos2::new(rect.center().x, rect.top() + icon_d * 0.5 + 8.0 - focus_t * 2.5);
-        let radius = icon_d * (0.48 + focus_t * 0.055);
+        let (float_y, breath) = self.resting_focus_motion(focused, focus_t);
+        let base_center = Pos2::new(rect.center().x, rect.top() + icon_d * 0.5 + 8.0 - focus_t * 2.5);
+        let center = Pos2::new(base_center.x, base_center.y - float_y);
+        let radius = icon_d * (0.48 + focus_t * 0.055 + breath * 0.008);
 
-        // Drop shadow
+        // Grounded drop shadow (softens & expands slightly as icon levitates)
         p.circle_filled(
-            center + Vec2::new(0.0, 4.0 + focus_t * 2.0),
-            radius + 1.0,
-            Color32::from_rgba_unmultiplied(0, 0, 0, (90.0 + focus_t * 55.0) as u8),
+            base_center + Vec2::new(0.0, 4.5 + focus_t * 2.5),
+            radius + 1.0 + breath * 2.0,
+            Color32::from_rgba_unmultiplied(0, 0, 0, (90.0 + focus_t * 50.0 - breath * 14.0) as u8),
         );
 
-        // Smooth animated focus glow halo + active focus animation effect
+        // Smooth animated focus glow halo + breathing resting aura
         if focus_t > 0.01 {
+            if breath > 0.01 {
+                p.circle_filled(
+                    center,
+                    radius + 9.5 + breath * 4.0,
+                    Color32::from_rgba_unmultiplied(
+                        accent.r(),
+                        accent.g(),
+                        accent.b(),
+                        (breath * 34.0) as u8,
+                    ),
+                );
+            }
             p.circle_filled(
                 center,
-                radius + 6.5 * focus_t,
+                radius + 6.5 * focus_t + breath * 1.8,
                 Color32::from_rgba_unmultiplied(
                     accent.r(),
                     accent.g(),
                     accent.b(),
-                    (focus_t * 72.0) as u8,
+                    (focus_t * 68.0 + breath * 24.0) as u8,
                 ),
             );
         }
@@ -2445,16 +2539,17 @@ impl AstryxTvApp {
             );
         }
 
-        // Crisp circular glass rim
+        // Crisp circular glass rim + orbital resting specular shimmer
         p.circle_stroke(
             center,
             radius,
             if focused {
-                Stroke::new(2.8, accent)
+                Stroke::new(2.6_f32, accent)
             } else {
-                Stroke::new(1.2, Color32::from_rgba_unmultiplied(255, 255, 255, 55))
+                Stroke::new(1.2_f32, Color32::from_rgba_unmultiplied(255, 255, 255, 55))
             },
         );
+        self.draw_resting_focus_overlay(ctx, p, center, radius, focused, focus_t, accent);
 
         // Label
         if self.config.show_labels {
@@ -7118,21 +7213,40 @@ impl AstryxTvApp {
                                         is_neighbor,
                                         0.08,
                                     );
-                                    let center = Pos2::new(
+                                    let (float_y, breath) = self.resting_focus_motion(is_focused, t);
+                                    let base_center = Pos2::new(
                                         slot_rect.center().x,
                                         slot_rect.top() + icon_d * 0.5 + 8.0 - t * 4.0 - nt * 2.0,
                                     );
-                                    let radius = icon_d * (0.46 + t * 0.065 + nt * 0.03);
+                                    let center = Pos2::new(base_center.x, base_center.y - float_y);
+                                    let radius = icon_d * (0.46 + t * 0.065 + nt * 0.03 + breath * 0.008);
                                     let p = ui.painter();
 
-                                    // Active focus animation effect (Ripple / Ambient Glow / Breathing Halo)
+                                    // Breathing resting aura + active focus animation effect
+                                    if breath > 0.01 {
+                                        p.circle_filled(
+                                            center,
+                                            radius + 7.5 + breath * 3.5,
+                                            Color32::from_rgba_unmultiplied(
+                                                accent.r(),
+                                                accent.g(),
+                                                accent.b(),
+                                                (breath * 42.0) as u8,
+                                            ),
+                                        );
+                                    }
                                     self.draw_focus_effects(ctx, p, center, radius, is_focused, accent);
 
-                                    // Drop shadow
+                                    // Grounded drop shadow
                                     p.circle_filled(
-                                        center + Vec2::new(0.0, 3.5 + t * 2.0),
-                                        radius + 1.0,
-                                        Color32::from_rgba_unmultiplied(0, 0, 0, (85.0 + t * 50.0) as u8),
+                                        base_center + Vec2::new(0.0, 4.0 + t * 2.5),
+                                        radius + 1.0 + breath * 1.8,
+                                        Color32::from_rgba_unmultiplied(
+                                            0,
+                                            0,
+                                            0,
+                                            (85.0 + t * 48.0 - breath * 14.0) as u8,
+                                        ),
                                     );
 
                                     if let Some(tex) = self.icon_textures.get(&app.package_name) {
@@ -7172,6 +7286,7 @@ impl AstryxTvApp {
                                             )
                                         },
                                     );
+                                    self.draw_resting_focus_overlay(ctx, p, center, radius, is_focused, t, accent);
 
                                     // Golden star dot badge on top-right of pinned favorite icons
                                     if self.config.favorites.contains(&app.package_name) {
