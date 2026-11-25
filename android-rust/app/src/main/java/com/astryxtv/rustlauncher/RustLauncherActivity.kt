@@ -450,6 +450,16 @@ class RustLauncherActivity : NativeActivity() {
             }
             startActivity(intent)
         } catch (_: Throwable) {
+            try {
+                @Suppress("DEPRECATION")
+                val fallback = Intent(Intent.ACTION_UNINSTALL_PACKAGE).apply {
+                    data = Uri.parse("package:$pkg")
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                startActivity(fallback)
+            } catch (_: Throwable) {
+                rustOpenAppInfo(pkg)
+            }
         }
     }
 

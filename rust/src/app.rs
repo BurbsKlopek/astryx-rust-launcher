@@ -158,6 +158,7 @@ pub struct AstryxTvApp {
     last_status_poll: Instant,
     last_weather_poll: Instant,
     last_grid_cols: usize,
+    pending_apps_refresh: bool,
 }
 
 impl AstryxTvApp {
@@ -290,6 +291,7 @@ impl AstryxTvApp {
             last_status_poll: now - Duration::from_secs(60),
             last_weather_poll: now - Duration::from_secs(900),
             last_grid_cols: 6,
+            pending_apps_refresh: false,
         };
 
         if web_enabled {
@@ -4894,8 +4896,8 @@ impl AstryxTvApp {
                 self.draw_modal_shell(
                     ctx,
                     &format!("App Options · {app_label}"),
-                    420.0,
                     430.0,
+                    495.0,
                     |this, ui, _ctx| {
                         let accent = this.config.accent();
                         ui.label(
@@ -4903,47 +4905,73 @@ impl AstryxTvApp {
                                 .font(FontId::proportional(11.5))
                                 .color(Color32::from_rgb(175, 192, 218)),
                         );
-                        ui.add_space(10.0);
+                        ui.add_space(8.0);
 
-                        let full_w = ui.available_width();
-                        for (idx, (id, label)) in actions.iter().enumerate() {
-                            let focused = this.modal_focus == idx;
-                            let fill = if focused {
-                                Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 85)
-                            } else {
-                                Color32::from_rgba_unmultiplied(255, 255, 255, 16)
-                            };
-                            let stroke = if focused {
-                                Stroke::new(2.0_f32, accent)
-                            } else {
-                                Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(255, 255, 255, 26))
-                            };
-                            let (rect, resp) = ui.allocate_exact_size(Vec2::new(full_w, 36.0), Sense::click());
-                            let p = ui.painter();
-                            p.rect_filled(rect, CornerRadius::same(10), fill);
-                            p.rect_stroke(rect, CornerRadius::same(10), stroke, egui::StrokeKind::Inside);
+                        egui::ScrollArea::vertical()
+                            .id_salt("app_options_scroll")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                let full_w = ui.available_width();
+                                for (idx, (id, label)) in actions.iter().enumerate() {
+                                    let focused = this.modal_focus == idx;
+                                    let is_uninstall = *id == "uninstall";
+                                    let fill = if focused {
+                                        if is_uninstall {
+                                            Color32::from_rgba_unmultiplied(239, 68, 68, 95)
+                                        } else {
+                                            Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 85)
+                                        }
+                                    } else if is_uninstall {
+                                        Color32::from_rgba_unmultiplied(239, 68, 68, 22)
+                                    } else {
+                                        Color32::from_rgba_unmultiplied(255, 255, 255, 16)
+                                    };
+                                    let stroke = if focused {
+                                        if is_uninstall {
+                                            Stroke::new(2.0_f32, Color32::from_rgb(248, 113, 113))
+                                        } else {
+                                            Stroke::new(2.0_f32, accent)
+                                        }
+                                    } else if is_uninstall {
+                                        Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(248, 113, 113, 70))
+                                    } else {
+                                        Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(255, 255, 255, 26))
+                                    };
+                                    let (rect, resp) = ui.allocate_exact_size(Vec2::new(full_w, 34.0), Sense::click());
+                                    if focused {
+                                        resp.scroll_to_me(Some(egui::Align::Center));
+                                    }
+                                    let p = ui.painter();
+                                    p.rect_filled(rect, CornerRadius::same(10), fill);
+                                    p.rect_stroke(rect, CornerRadius::same(10), stroke, egui::StrokeKind::Inside);
 
-                            let ic_c = Pos2::new(rect.left() + 22.0, rect.center().y);
-                            let ic_col = if *id == "uninstall" {
-                                Color32::from_rgb(248, 113, 113)
-                            } else if *id == "pin" {
-                                Color32::from_rgb(250, 204, 21)
-                            } else {
-                                Color32::WHITE
-                            };
-                            Self::draw_action_icon(p, ic_c, id, ic_col);
-                            p.text(
-                                Pos2::new(rect.left() + 42.0, rect.center().y),
-                                Align2::LEFT_CENTER,
-                                label.as_str(),
-                                FontId::proportional(14.0),
-                                Color32::WHITE,
-                            );
-                            if resp.clicked() {
-                                chosen = Some(*id);
-                            }
-                            ui.add_space(5.0);
-                        }
+                                    let ic_c = Pos2::new(rect.left() + 22.0, rect.center().y);
+                                    let ic_col = if is_uninstall {
+                                        Color32::from_rgb(248, 113, 113)
+                                    } else if *id == "pin" {
+                                        Color32::from_rgb(250, 204, 21)
+                                    } else {
+                                        Color32::WHITE
+                                    };
+                                    Self::draw_action_icon(p, ic_c, id, ic_col);
+                                    let txt_col = if is_uninstall {
+                                        Color32::from_rgb(254, 202, 202)
+                                    } else {
+                                        Color32::WHITE
+                                    };
+                                    p.text(
+                                        Pos2::new(rect.left() + 42.0, rect.center().y),
+                                        Align2::LEFT_CENTER,
+                                        label.as_str(),
+                                        FontId::proportional(14.0),
+                                        txt_col,
+                                    );
+                                    if resp.clicked() {
+                                        chosen = Some(*id);
+                                    }
+                                    ui.add_space(5.0);
+                                }
+                            });
                     },
                 );
 
@@ -5012,6 +5040,7 @@ impl AstryxTvApp {
                             self.modal = ActiveModal::None;
                         }
                         "uninstall" => {
+                            self.pending_apps_refresh = true;
                             bridge::uninstall_app(&pkg);
                             self.modal = ActiveModal::None;
                         }
@@ -7195,10 +7224,13 @@ impl eframe::App for AstryxTvApp {
         self.drain_messages(ctx);
 
         // Instant refresh on network/VPN change or Activity resume + 3s fallback poll
-        if bridge::take_status_refresh_requested()
-            || self.last_status_poll.elapsed() > Duration::from_secs(3)
-        {
+        let status_changed = bridge::take_status_refresh_requested();
+        if status_changed || self.last_status_poll.elapsed() > Duration::from_secs(3) {
             self.spawn_load_status(ctx.clone());
+            if status_changed && self.pending_apps_refresh {
+                self.pending_apps_refresh = false;
+                self.spawn_load_apps(ctx.clone());
+            }
         }
         if self.last_weather_poll.elapsed() > Duration::from_secs(900) {
             self.spawn_load_weather(ctx.clone());
