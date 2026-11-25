@@ -4,8 +4,10 @@ import android.app.ActivityManager
 import android.app.NativeActivity
 import android.app.PendingIntent
 import android.app.role.RoleManager
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageInstaller
 import android.content.pm.PackageManager
@@ -51,12 +53,21 @@ class RustLauncherActivity : NativeActivity() {
     private external fun nativeOnBackPressed()
     private external fun nativeOnMenuPressed()
     private external fun nativeOnStatusChanged()
+    private external fun nativeOnPackagesChanged()
 
     private var netCallback: ConnectivityManager.NetworkCallback? = null
+    private var packageReceiver: BroadcastReceiver? = null
 
     private fun notifyStatusChanged() {
         try {
             nativeOnStatusChanged()
+        } catch (_: UnsatisfiedLinkError) {
+        }
+    }
+
+    private fun notifyPackagesChanged() {
+        try {
+            nativeOnPackagesChanged()
         } catch (_: UnsatisfiedLinkError) {
         }
     }
@@ -98,6 +109,7 @@ class RustLauncherActivity : NativeActivity() {
         prefer4kHighRefreshDisplayMode()
         enterImmersiveMode()
         registerNetworkWatcher()
+        registerPackageWatcher()
     }
 
     override fun onResume() {
@@ -106,8 +118,43 @@ class RustLauncherActivity : NativeActivity() {
     }
 
     override fun onDestroy() {
+        unregisterPackageWatcher()
         unregisterNetworkWatcher()
         super.onDestroy()
+    }
+
+    private fun registerPackageWatcher() {
+        try {
+            val filter = IntentFilter().apply {
+                addAction(Intent.ACTION_PACKAGE_ADDED)
+                addAction(Intent.ACTION_PACKAGE_REMOVED)
+                addAction(Intent.ACTION_PACKAGE_REPLACED)
+                addAction(Intent.ACTION_PACKAGE_CHANGED)
+                addDataScheme("package")
+            }
+            val recv = object : BroadcastReceiver() {
+                override fun onReceive(context: Context?, intent: Intent?) {
+                    notifyPackagesChanged()
+                }
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                registerReceiver(recv, filter, Context.RECEIVER_EXPORTED)
+            } else {
+                @Suppress("UnspecifiedRegisterReceiverFlag")
+                registerReceiver(recv, filter)
+            }
+            packageReceiver = recv
+        } catch (_: Throwable) {
+        }
+    }
+
+    private fun unregisterPackageWatcher() {
+        try {
+            val recv = packageReceiver ?: return
+            unregisterReceiver(recv)
+            packageReceiver = null
+        } catch (_: Throwable) {
+        }
     }
 
     private fun registerNetworkWatcher() {

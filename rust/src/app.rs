@@ -7223,6 +7223,12 @@ impl eframe::App for AstryxTvApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_messages(ctx);
 
+        // Instant refresh when any app is installed, updated, or uninstalled
+        if bridge::take_packages_changed() {
+            self.pending_apps_refresh = false;
+            self.spawn_load_apps(ctx.clone());
+        }
+
         // Instant refresh on network/VPN change or Activity resume + 3s fallback poll
         let status_changed = bridge::take_status_refresh_requested();
         if status_changed || self.last_status_poll.elapsed() > Duration::from_secs(3) {
