@@ -7336,6 +7336,9 @@ impl AstryxTvApp {
 
 impl eframe::App for AstryxTvApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if bridge::is_paused() {
+            return;
+        }
         self.drain_messages(ctx);
 
         // Instant refresh when any app is installed, updated, or uninstalled

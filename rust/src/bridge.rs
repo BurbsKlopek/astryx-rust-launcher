@@ -38,6 +38,7 @@ static BACK_PRESSED: AtomicBool = AtomicBool::new(false);
 static MENU_PRESSED: AtomicBool = AtomicBool::new(false);
 static STATUS_REFRESH_REQUESTED: AtomicBool = AtomicBool::new(false);
 static PACKAGES_CHANGED: AtomicBool = AtomicBool::new(false);
+static IS_PAUSED: AtomicBool = AtomicBool::new(false);
 
 pub fn init(vm_ptr: *mut c_void, activity_ptr: *mut c_void) {
     let _ = ANDROID_HANDLES.set((vm_ptr as usize, activity_ptr as usize));
@@ -45,6 +46,10 @@ pub fn init(vm_ptr: *mut c_void, activity_ptr: *mut c_void) {
 
 pub fn set_egui_ctx(ctx: egui::Context) {
     let _ = EGUI_CTX.set(ctx);
+}
+
+pub fn is_paused() -> bool {
+    IS_PAUSED.load(Ordering::SeqCst)
 }
 
 pub fn take_back_pressed() -> bool {
@@ -91,8 +96,10 @@ pub extern "system" fn Java_com_astryxtv_rustlauncher_RustLauncherActivity_nativ
     _obj: JObject,
 ) {
     STATUS_REFRESH_REQUESTED.store(true, Ordering::SeqCst);
-    if let Some(ctx) = EGUI_CTX.get() {
-        ctx.request_repaint();
+    if !is_paused() {
+        if let Some(ctx) = EGUI_CTX.get() {
+            ctx.request_repaint();
+        }
     }
 }
 
@@ -102,6 +109,27 @@ pub extern "system" fn Java_com_astryxtv_rustlauncher_RustLauncherActivity_nativ
     _obj: JObject,
 ) {
     PACKAGES_CHANGED.store(true, Ordering::SeqCst);
+    if !is_paused() {
+        if let Some(ctx) = EGUI_CTX.get() {
+            ctx.request_repaint();
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_astryxtv_rustlauncher_RustLauncherActivity_nativeOnPaused(
+    _env: jni::JNIEnv,
+    _obj: JObject,
+) {
+    IS_PAUSED.store(true, Ordering::SeqCst);
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_astryxtv_rustlauncher_RustLauncherActivity_nativeOnResumed(
+    _env: jni::JNIEnv,
+    _obj: JObject,
+) {
+    IS_PAUSED.store(false, Ordering::SeqCst);
     if let Some(ctx) = EGUI_CTX.get() {
         ctx.request_repaint();
     }

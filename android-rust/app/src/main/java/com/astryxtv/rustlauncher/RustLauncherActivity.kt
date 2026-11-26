@@ -54,6 +54,8 @@ class RustLauncherActivity : NativeActivity() {
     private external fun nativeOnMenuPressed()
     private external fun nativeOnStatusChanged()
     private external fun nativeOnPackagesChanged()
+    private external fun nativeOnPaused()
+    private external fun nativeOnResumed()
 
     private var netCallback: ConnectivityManager.NetworkCallback? = null
     private var packageReceiver: BroadcastReceiver? = null
@@ -68,6 +70,20 @@ class RustLauncherActivity : NativeActivity() {
     private fun notifyPackagesChanged() {
         try {
             nativeOnPackagesChanged()
+        } catch (_: UnsatisfiedLinkError) {
+        }
+    }
+
+    private fun notifyPaused() {
+        try {
+            nativeOnPaused()
+        } catch (_: UnsatisfiedLinkError) {
+        }
+    }
+
+    private fun notifyResumed() {
+        try {
+            nativeOnResumed()
         } catch (_: UnsatisfiedLinkError) {
         }
     }
@@ -114,7 +130,18 @@ class RustLauncherActivity : NativeActivity() {
 
     override fun onResume() {
         super.onResume()
+        notifyResumed()
         notifyStatusChanged()
+    }
+
+    override fun onPause() {
+        notifyPaused()
+        super.onPause()
+    }
+
+    override fun onStop() {
+        notifyPaused()
+        super.onStop()
     }
 
     override fun onDestroy() {
@@ -193,6 +220,11 @@ class RustLauncherActivity : NativeActivity() {
     override fun surfaceCreated(holder: SurfaceHolder) {
         super.surfaceCreated(holder)
         applySurfaceFrameRate(holder)
+    }
+
+    override fun surfaceDestroyed(holder: SurfaceHolder) {
+        notifyPaused()
+        super.surfaceDestroyed(holder)
     }
 
     private fun applySurfaceFrameRate(holder: SurfaceHolder) {
