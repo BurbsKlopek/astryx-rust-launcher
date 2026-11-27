@@ -1,5 +1,6 @@
 use crate::a2ui::{A2uiEngine, SAMPLE_A2UI_PAYLOAD};
 use crate::bridge::{self, TvAppInfo, TvSystemStatus};
+use crate::gemini;
 use crate::theme::{
     AppFolder, AstryxThemeId, FocusAnimStyle, IconSize, LauncherConfig, LayoutStyle,
     SettingsViewMode, SortOrder, StartupMode, WeatherScene, ACCENT_PRESETS, WEATHER_CITY_PRESETS,
@@ -31,6 +32,8 @@ enum BgMsg {
     UpdateChecked(UpdateCheckOutcome, bool), // (outcome, silent)
     UpdateDownloadProgress(u64, u64),
     UpdateDownloadDone(Result<String, String>),
+    GeminiReplied(Result<gemini::GeminiReply, String>),
+    GeminiA2uiReady(Result<String, String>),
 }
 
 #[derive(Debug, Clone)]
@@ -108,10 +111,14 @@ pub struct AstryxTvApp {
     wallpaper_tex: Option<(WeatherScene, u8, TextureHandle)>,
     wallpaper_loading: Option<(WeatherScene, u8)>,
 
-    // A2UI
+    // A2UI & Gemini AI
     a2ui: A2uiEngine,
     a2ui_input: String,
     a2ui_feedback: String,
+    gemini_prompt: String,
+    gemini_reply: String,
+    gemini_last_id: Option<String>,
+    gemini_busy: bool,
 
     // Internal OTA Updater
     app_version: String,
@@ -247,6 +254,10 @@ impl AstryxTvApp {
             a2ui: A2uiEngine::default(),
             a2ui_input: SAMPLE_A2UI_PAYLOAD.to_string(),
             a2ui_feedback: String::new(),
+            gemini_prompt: "Suggest 3 great shows or movies to watch tonight".to_string(),
+            gemini_reply: String::new(),
+            gemini_last_id: None,
+            gemini_busy: false,
             app_version: bridge::get_app_version(),
             display_hz: bridge::get_refresh_rate(),
             fps_frame_count: 0,
@@ -733,6 +744,47 @@ impl AstryxTvApp {
                         self.show_toast(format!("Update failed: {e}"));
                     }
                 },
+                BgMsg::GeminiReplied(res) => {
+                    self.gemini_busy = false;
+                    match res {
+                        Ok(reply) => {
+                            if !reply.interaction_id.is_empty() {
+                                self.gemini_last_id = Some(reply.interaction_id);
+                            }
+                            self.gemini_reply = reply.text;
+                            self.a2ui_feedback =
+                                format!("✓ Gemini ({}) replied", self.config.gemini_model);
+                        }
+                        Err(e) => {
+                            self.a2ui_feedback = format!("Gemini error: {e}");
+                            self.show_toast(format!("Gemini error: {e}"));
+                        }
+                    }
+                }
+                BgMsg::GeminiA2uiReady(res) => {
+                    self.gemini_busy = false;
+                    match res {
+                        Ok(json_payload) => {
+                            self.a2ui_input = json_payload.clone();
+                            match self.a2ui.process_json(&json_payload) {
+                                Ok(n) => {
+                                    self.a2ui_feedback = format!(
+                                        "✓ Gemini generated & applied {n} live A2UI surface message(s)"
+                                    );
+                                    self.show_toast("✓ Gemini A2UI shelf added to Home!");
+                                }
+                                Err(e) => {
+                                    self.a2ui_feedback =
+                                        format!("Gemini JSON parse error: {e}");
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            self.a2ui_feedback = format!("Gemini error: {e}");
+                            self.show_toast(format!("Gemini error: {e}"));
+                        }
+                    }
+                }
             }
         }
 
@@ -805,6 +857,41 @@ impl AstryxTvApp {
                         self.show_toast(format!("A2UI: Applied {n} surface message(s)"));
                     }
                 }
+                WebCmd::SetGeminiKey(key) => {
+                    self.config.gemini_api_key = key;
+                    self.gemini_last_id = None;
+                    self.save_config();
+                    self.show_toast(if self.config.gemini_api_key.is_empty() {
+                        "Cleared Gemini API key"
+                    } else {
+                        "✓ Saved Gemini API key"
+                    });
+                }
+                WebCmd::SetGeminiModel(model) => {
+                    if !model.is_empty() {
+                        self.config.gemini_model = model;
+                        self.gemini_last_id = None;
+                        self.save_config();
+                        self.show_toast(format!("Gemini model: {}", self.config.gemini_model));
+                    }
+                }
+                WebCmd::AskGemini(prompt) => {
+                    if !self.config.gemini_enabled {
+                        self.show_toast("Gemini AI is disabled in Settings");
+                    } else {
+                        self.gemini_prompt = prompt.clone();
+                        self.open_modal(ActiveModal::A2ui);
+                        self.spawn_ask_gemini(ctx.clone(), prompt);
+                    }
+                }
+                WebCmd::GeminiA2ui(prompt) => {
+                    if !self.config.gemini_enabled {
+                        self.show_toast("Gemini AI is disabled in Settings");
+                    } else {
+                        self.gemini_prompt = prompt.clone();
+                        self.spawn_gemini_a2ui(ctx.clone(), prompt);
+                    }
+                }
                 WebCmd::ImportConfigJson(json) => {
                     if let Ok(cfg) = serde_json::from_str::<LauncherConfig>(&json) {
                         self.config = cfg;
@@ -816,6 +903,79 @@ impl AstryxTvApp {
                 }
             }
         }
+    }
+
+    fn tv_context_summary(&self) -> String {
+        let w = self
+            .weather
+            .as_ref()
+            .map(|w| format!("{}, {} ({}°C)", self.config.weather_city, w.condition, w.temp_c))
+            .unwrap_or_else(|| self.config.weather_city.clone());
+        let fav_names: Vec<String> = self
+            .cached_favs
+            .iter()
+            .take(6)
+            .map(|a| self.display_label(a))
+            .collect();
+        format!(
+            "Time: {} {}; Weather: {}; Installed apps: {}; Pinned apps: [{}]",
+            self.cached_time_str,
+            self.cached_date_str,
+            w,
+            self.apps.len(),
+            fav_names.join(", ")
+        )
+    }
+
+    fn spawn_ask_gemini(&mut self, ctx: egui::Context, prompt: String) {
+        if !self.config.gemini_enabled {
+            self.a2ui_feedback = "Gemini AI is disabled in Settings".to_string();
+            self.show_toast("Gemini AI is disabled in Settings");
+            return;
+        }
+        if self.gemini_busy {
+            return;
+        }
+        let api_key = self.config.gemini_api_key.clone();
+        let model = self.config.gemini_model.clone();
+        let prev_id = self.gemini_last_id.clone();
+        let tv_ctx = self.tv_context_summary();
+        let tx = self.tx.clone();
+        self.gemini_busy = true;
+        self.a2ui_feedback = format!("✨ Asking Gemini ({model})...");
+        std::thread::spawn(move || {
+            let res = gemini::ask_tv_assistant(
+                &api_key,
+                &model,
+                &prompt,
+                prev_id.as_deref(),
+                &tv_ctx,
+            );
+            let _ = tx.send(BgMsg::GeminiReplied(res));
+            ctx.request_repaint();
+        });
+    }
+
+    fn spawn_gemini_a2ui(&mut self, ctx: egui::Context, prompt: String) {
+        if !self.config.gemini_enabled {
+            self.a2ui_feedback = "Gemini AI is disabled in Settings".to_string();
+            self.show_toast("Gemini AI is disabled in Settings");
+            return;
+        }
+        if self.gemini_busy {
+            return;
+        }
+        let api_key = self.config.gemini_api_key.clone();
+        let model = self.config.gemini_model.clone();
+        let tv_ctx = self.tv_context_summary();
+        let tx = self.tx.clone();
+        self.gemini_busy = true;
+        self.a2ui_feedback = format!("🧩 Gemini ({model}) building A2UI surface...");
+        std::thread::spawn(move || {
+            let res = gemini::generate_a2ui_surface(&api_key, &model, &prompt, &tv_ctx);
+            let _ = tx.send(BgMsg::GeminiA2uiReady(res));
+            ctx.request_repaint();
+        });
     }
 
     fn visible_apps(&self) -> Vec<TvAppInfo> {
@@ -3852,9 +4012,9 @@ impl AstryxTvApp {
             }
 
             ActiveModal::Settings => {
-                // 28 settings (0..28, 4 clean categories with Theme & Glass merged in!) + row 28 = Android TV Shortcuts
-                const SETTING_COUNT: usize = 28;
-                const SYS_IDX: usize = 28;
+                // 29 settings (0..29, 4 clean categories with Theme & Glass merged in!) + row 29 = Android TV Shortcuts
+                const SETTING_COUNT: usize = 29;
+                const SYS_IDX: usize = 29;
                 const GRID_COLS: usize = 3;
                 let is_grid = self.config.settings_view == SettingsViewMode::Grid;
 
@@ -4079,6 +4239,19 @@ impl AstryxTvApp {
                     }
                     27 => {
                         this.open_modal(ActiveModal::Donate);
+                    }
+                    28 => {
+                        this.config.gemini_enabled = !this.config.gemini_enabled;
+                        if !this.config.gemini_enabled {
+                            this.gemini_reply.clear();
+                            this.gemini_last_id = None;
+                        }
+                        this.save_config();
+                        this.show_toast(if this.config.gemini_enabled {
+                            "Gemini AI ON"
+                        } else {
+                            "Gemini AI OFF"
+                        });
                     }
                     _ => {}
                 };
@@ -4390,6 +4563,17 @@ impl AstryxTvApp {
                                 "Support".to_string(),
                                 false,
                                 15,
+                            ),
+                            (
+                                "Gemini AI",
+                                if this.config.gemini_enabled {
+                                    "ON"
+                                } else {
+                                    "OFF"
+                                }
+                                .to_string(),
+                                this.config.gemini_enabled,
+                                200,
                             ),
                         ];
 
@@ -4865,7 +5049,7 @@ impl AstryxTvApp {
                         if i.key_pressed(Key::ArrowLeft) {
                             self.modal_focus = self.modal_focus.saturating_sub(1);
                         } else if i.key_pressed(Key::ArrowRight) {
-                            self.modal_focus = (self.modal_focus + 1).min(2);
+                            self.modal_focus = (self.modal_focus + 1).min(4);
                         } else if i.key_pressed(Key::Enter) || i.key_pressed(Key::Space) {
                             trigger_btn = true;
                         }
@@ -4873,7 +5057,30 @@ impl AstryxTvApp {
                 }
                 if trigger_btn {
                     match self.modal_focus {
-                        0 => match self.a2ui.process_json(&self.a2ui_input) {
+                        0 => {
+                            let p = self.gemini_prompt.trim().to_string();
+                            if !p.is_empty() {
+                                self.spawn_ask_gemini(ctx.clone(), p);
+                            }
+                        }
+                        1 => {
+                            let p = self.gemini_prompt.trim().to_string();
+                            let prompt = if p.is_empty() {
+                                "Create a Tonight on TV dashboard shelf".to_string()
+                            } else {
+                                p
+                            };
+                            self.spawn_gemini_a2ui(ctx.clone(), prompt);
+                        }
+                        2 => {
+                            self.config.gemini_model =
+                                gemini::next_model(&self.config.gemini_model).to_string();
+                            self.gemini_last_id = None;
+                            self.save_config();
+                            self.a2ui_feedback =
+                                format!("Switched Gemini model to {}", self.config.gemini_model);
+                        }
+                        3 => match self.a2ui.process_json(&self.a2ui_input) {
                             Ok(n) => {
                                 self.a2ui_feedback =
                                     format!("✓ Applied {n} A2UI v1.0 message(s) natively in Rust");
@@ -4882,27 +5089,72 @@ impl AstryxTvApp {
                                 self.a2ui_feedback = format!("Error: {e}");
                             }
                         },
-                        1 => {
-                            self.a2ui_input = SAMPLE_A2UI_PAYLOAD.to_string();
-                            self.a2ui_feedback = "Loaded sample A2UI v1.0 payload".to_string();
-                        }
                         _ => {
                             self.a2ui.clear_custom();
-                            self.a2ui_feedback = "Cleared custom surfaces".to_string();
+                            self.gemini_reply.clear();
+                            self.gemini_last_id = None;
+                            self.a2ui_feedback = "Cleared Gemini chat & custom surfaces".to_string();
                         }
                     }
                 }
 
+                let mut ask_clicked = false;
+                let mut a2ui_clicked = false;
+                let mut model_clicked = false;
+                let model_lbl = format!("Model: {}", self.config.gemini_model);
+                let gemini_on = self.config.gemini_enabled;
+                let has_key = !self.config.gemini_api_key.trim().is_empty();
+                let companion_url = format!("http://{}:{WEB_COMPANION_PORT}", self.local_ip);
+
                 self.draw_modal_shell(
                     ctx,
-                    "A2UI v1.0 Native Surface Studio  (Left/Right select · OK run)",
-                    760.0,
-                    430.0,
+                    if gemini_on {
+                        "✨ Gemini AI & A2UI Studio  (Left/Right select · OK run)"
+                    } else {
+                        "A2UI v1.0 Native Surface Studio  (Gemini AI disabled in Settings)"
+                    },
+                    800.0,
+                    480.0,
                     |this, ui, _ctx| {
                         let accent = this.config.accent();
-                        ui.horizontal(|ui| {
-                            if Self::modal_btn(ui, "Inject Live Surface", true, this.modal_focus == 0, accent) {
+                        if !gemini_on {
+                            ui.label(
+                                RichText::new("Gemini AI is disabled — enable it in Settings → Gemini AI")
+                                    .color(Color32::from_rgb(251, 191, 36))
+                                    .strong(),
+                            );
+                            ui.add_space(4.0);
+                        } else if !has_key {
+                            ui.label(
+                                RichText::new(format!(
+                                    "Add your Gemini API key via Phone Companion ({companion_url})"
+                                ))
+                                .color(Color32::from_rgb(251, 191, 36))
+                                .strong(),
+                            );
+                            ui.add_space(4.0);
+                        }
+
+                        ui.horizontal_wrapped(|ui| {
+                            let ask_lbl = if this.gemini_busy {
+                                "✨ Thinking..."
+                            } else {
+                                "✨ Ask Gemini"
+                            };
+                            if Self::modal_btn(ui, ask_lbl, true, this.modal_focus == 0, accent) {
                                 this.modal_focus = 0;
+                                ask_clicked = true;
+                            }
+                            if Self::modal_btn(ui, "🧩 Build A2UI Shelf", false, this.modal_focus == 1, accent) {
+                                this.modal_focus = 1;
+                                a2ui_clicked = true;
+                            }
+                            if Self::modal_btn(ui, &model_lbl, false, this.modal_focus == 2, accent) {
+                                this.modal_focus = 2;
+                                model_clicked = true;
+                            }
+                            if Self::modal_btn(ui, "Inject JSON", false, this.modal_focus == 3, accent) {
+                                this.modal_focus = 3;
                                 match this.a2ui.process_json(&this.a2ui_input) {
                                     Ok(n) => {
                                         this.a2ui_feedback =
@@ -4913,29 +5165,92 @@ impl AstryxTvApp {
                                     }
                                 }
                             }
-                            if Self::modal_btn(ui, "Load Sample", false, this.modal_focus == 1, accent) {
-                                this.modal_focus = 1;
-                                this.a2ui_input = SAMPLE_A2UI_PAYLOAD.to_string();
-                            }
-                            if Self::modal_btn(ui, "Clear Surfaces", false, this.modal_focus == 2, accent) {
-                                this.modal_focus = 2;
+                            if Self::modal_btn(ui, "Clear", false, this.modal_focus == 4, accent) {
+                                this.modal_focus = 4;
                                 this.a2ui.clear_custom();
-                                this.a2ui_feedback = "Cleared custom surfaces".to_string();
+                                this.gemini_reply.clear();
+                                this.gemini_last_id = None;
+                                this.a2ui_feedback = "Cleared Gemini chat & custom surfaces".to_string();
                             }
                         });
+
                         if !this.a2ui_feedback.is_empty() {
                             ui.add_space(6.0);
                             ui.label(RichText::new(&this.a2ui_feedback).color(accent).strong());
                         }
+
+                        ui.add_space(6.0);
+                        ui.label(
+                            RichText::new("GEMINI PROMPT")
+                                .font(FontId::proportional(11.0))
+                                .strong()
+                                .color(Color32::from_rgb(160, 178, 204)),
+                        );
+                        ui.add(
+                            egui::TextEdit::singleline(&mut this.gemini_prompt)
+                                .desired_width(f32::INFINITY)
+                                .hint_text("Ask Gemini anything or describe a TV shelf..."),
+                        );
+
+                        if !this.gemini_reply.is_empty() {
+                            ui.add_space(8.0);
+                            egui::Frame::NONE
+                                .fill(Color32::from_rgba_unmultiplied(15, 23, 42, 195))
+                                .stroke(Stroke::new(1.0_f32, accent))
+                                .corner_radius(CornerRadius::same(12))
+                                .inner_margin(egui::Margin::same(12))
+                                .show(ui, |ui| {
+                                    ScrollArea::vertical()
+                                        .max_height(150.0)
+                                        .show(ui, |ui| {
+                                            ui.label(
+                                                RichText::new(&this.gemini_reply)
+                                                    .font(FontId::proportional(14.5))
+                                                    .color(Color32::WHITE),
+                                            );
+                                        });
+                                });
+                        }
+
                         ui.add_space(8.0);
+                        ui.label(
+                            RichText::new("A2UI v1.0 PAYLOAD")
+                                .font(FontId::proportional(11.0))
+                                .strong()
+                                .color(Color32::from_rgb(160, 178, 204)),
+                        );
                         ui.add(
                             egui::TextEdit::multiline(&mut this.a2ui_input)
-                                .desired_rows(12)
+                                .desired_rows(5)
                                 .desired_width(f32::INFINITY)
                                 .code_editor(),
                         );
                     },
                 );
+
+                if ask_clicked {
+                    let p = self.gemini_prompt.trim().to_string();
+                    if !p.is_empty() {
+                        self.spawn_ask_gemini(ctx.clone(), p);
+                    }
+                }
+                if a2ui_clicked {
+                    let p = self.gemini_prompt.trim().to_string();
+                    let prompt = if p.is_empty() {
+                        "Create a Tonight on TV dashboard shelf".to_string()
+                    } else {
+                        p
+                    };
+                    self.spawn_gemini_a2ui(ctx.clone(), prompt);
+                }
+                if model_clicked {
+                    self.config.gemini_model =
+                        gemini::next_model(&self.config.gemini_model).to_string();
+                    self.gemini_last_id = None;
+                    self.save_config();
+                    self.a2ui_feedback =
+                        format!("Switched Gemini model to {}", self.config.gemini_model);
+                }
             }
 
             ActiveModal::AppContext(pkg) => {

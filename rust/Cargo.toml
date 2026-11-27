@@ -28,5 +28,6 @@ codegen-units = 1
 strip = true
 
 [patch.crates-io]
+eframe = { path = "vendor/eframe" }
 egui_glow = { path = "vendor/egui_glow" }
 egui-winit = { path = "vendor/egui-winit" }

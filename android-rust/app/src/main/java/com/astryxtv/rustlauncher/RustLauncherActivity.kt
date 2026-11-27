@@ -46,6 +46,15 @@ import kotlin.math.roundToInt
  */
 class RustLauncherActivity : NativeActivity() {
 
+    companion object {
+        init {
+            try {
+                System.loadLibrary("astryx_tv_rust")
+            } catch (_: UnsatisfiedLinkError) {
+            }
+        }
+    }
+
     private val prefs by lazy {
         getSharedPreferences("astryx_tv_rust_prefs", Context.MODE_PRIVATE)
     }
@@ -219,6 +228,7 @@ class RustLauncherActivity : NativeActivity() {
 
     override fun surfaceCreated(holder: SurfaceHolder) {
         super.surfaceCreated(holder)
+        notifyResumed()
         applySurfaceFrameRate(holder)
     }
 

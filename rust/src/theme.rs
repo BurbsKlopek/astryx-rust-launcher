@@ -257,6 +257,10 @@ fn default_startup_delay() -> u8 {
     2
 }
 
+fn default_gemini_model() -> String {
+    "gemini-4-hydrogen".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LauncherConfig {
     pub astryx_theme: AstryxThemeId,
@@ -337,6 +341,12 @@ pub struct LauncherConfig {
     pub custom_order: Vec<String>,
     #[serde(default)]
     pub custom_labels: HashMap<String, String>,
+    #[serde(default = "default_true")]
+    pub gemini_enabled: bool,
+    #[serde(default)]
+    pub gemini_api_key: String,
+    #[serde(default = "default_gemini_model")]
+    pub gemini_model: String,
 }
 
 impl Default for LauncherConfig {
@@ -389,6 +399,9 @@ impl Default for LauncherConfig {
             recents: Vec::new(),
             custom_order: Vec::new(),
             custom_labels: HashMap::new(),
+            gemini_enabled: true,
+            gemini_api_key: String::new(),
+            gemini_model: default_gemini_model(),
         }
     }
 }

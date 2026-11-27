@@ -18,6 +18,10 @@ pub enum WebCmd {
     PushA2ui(String),
     ImportConfigJson(String),
     TriggerSleep,
+    SetGeminiKey(String),
+    SetGeminiModel(String),
+    AskGemini(String),
+    GeminiA2ui(String),
 }
 
 const INDEX_HTML: &str = r#"<!doctype html>
@@ -54,6 +58,28 @@ const INDEX_HTML: &str = r#"<!doctype html>
       <button onclick="post('/api/clear-ram','')">⚡ Clear RAM</button>
       <button class="sec" onclick="post('/api/toggle-overlay','')">📊 HUD Overlay</button>
       <button class="sec" onclick="post('/api/sleep','')">🌙 Sleep TV</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>✨ Gemini AI (TV Assistant &amp; A2UI)</h2>
+    <div class="row">
+      <input id="gkey" type="password" placeholder="Paste Gemini API key (AIza...)"/>
+      <button class="sec" onclick="post('/api/gemini-key',document.getElementById('gkey').value)">Save Key</button>
+    </div>
+    <div class="row">
+      <select id="gmodel" onchange="post('/api/gemini-model',this.value)">
+        <option value="gemini-4-hydrogen">gemini-4-hydrogen (Fast Balanced)</option>
+        <option value="gemini-4-neon">gemini-4-neon (Frontier)</option>
+        <option value="gemini-3.5-flash-lite">gemini-3.5-flash-lite (Ultra Fast)</option>
+      </select>
+    </div>
+    <div class="row">
+      <input id="gprompt" placeholder="Ask Gemini or describe a TV dashboard shelf..."/>
+    </div>
+    <div class="row">
+      <button onclick="post('/api/gemini-ask',document.getElementById('gprompt').value)">✨ Ask on TV</button>
+      <button class="sec" onclick="post('/api/gemini-a2ui',document.getElementById('gprompt').value)">🧩 Build A2UI Shelf</button>
     </div>
   </div>
 
@@ -274,6 +300,38 @@ fn handle_client(
             let _ = tx.send(WebCmd::PushA2ui(payload));
             ctx.request_repaint();
             respond(&mut stream, "200 OK", "text/plain", b"Pushed A2UI surface to TV");
+        }
+        ("POST", "/api/gemini-key") => {
+            let key = String::from_utf8_lossy(&body).trim().to_string();
+            let _ = tx.send(WebCmd::SetGeminiKey(key));
+            ctx.request_repaint();
+            respond(&mut stream, "200 OK", "text/plain", b"Saved Gemini API key on TV");
+        }
+        ("POST", "/api/gemini-model") => {
+            let m = String::from_utf8_lossy(&body).trim().to_string();
+            let _ = tx.send(WebCmd::SetGeminiModel(m.clone()));
+            ctx.request_repaint();
+            respond(&mut stream, "200 OK", "text/plain", format!("Gemini model -> {m}").as_bytes());
+        }
+        ("POST", "/api/gemini-ask") => {
+            let prompt = String::from_utf8_lossy(&body).trim().to_string();
+            if prompt.is_empty() {
+                respond(&mut stream, "400 Bad Request", "text/plain", b"Enter a prompt first");
+            } else {
+                let _ = tx.send(WebCmd::AskGemini(prompt));
+                ctx.request_repaint();
+                respond(&mut stream, "200 OK", "text/plain", b"Asking Gemini on TV...");
+            }
+        }
+        ("POST", "/api/gemini-a2ui") => {
+            let prompt = String::from_utf8_lossy(&body).trim().to_string();
+            if prompt.is_empty() {
+                respond(&mut stream, "400 Bad Request", "text/plain", b"Enter a prompt first");
+            } else {
+                let _ = tx.send(WebCmd::GeminiA2ui(prompt));
+                ctx.request_repaint();
+                respond(&mut stream, "200 OK", "text/plain", b"Generating A2UI surface with Gemini...");
+            }
         }
         ("POST", "/api/import-config") => {
             let json = String::from_utf8_lossy(&body).to_string();

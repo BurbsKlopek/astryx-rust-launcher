@@ -1,6 +1,7 @@
 mod a2ui;
 mod app;
 mod bridge;
+mod gemini;
 mod theme;
 mod updater;
 mod weather;
@@ -27,4 +28,9 @@ fn android_main(app: AndroidApp) {
     ) {
         log::error!("eframe exited with error: {e:?}");
     }
+    // winit forbids creating a second EventLoop in the same Android process
+    // (RecreationAttempt) after a NativeActivity destroy, and the web companion
+    // thread holds port 8787. Always terminate the process cleanly on exit so
+    // Android spawns a fresh process on next launch.
+    std::process::exit(0);
 }

@@ -32,7 +32,7 @@
 
         <activity
             android:name=".RustLauncherActivity"
-            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|keyboard|navigation|uiMode"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|density|colorMode|locale|layoutDirection|fontScale|keyboardHidden|keyboard|navigation|uiMode"
             android:exported="true"
             android:launchMode="singleTask"
             android:screenOrientation="landscape"
