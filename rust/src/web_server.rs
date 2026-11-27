@@ -21,7 +21,9 @@ pub enum WebCmd {
     SetGeminiKey(String),
     SetGeminiModel(String),
     AskGemini(String),
+    AskGeminiVoice(Vec<u8>, String),
     GeminiA2ui(String),
+    SetScreensaverStyle(String),
 }
 
 const INDEX_HTML: &str = r#"<!doctype html>
@@ -75,10 +77,13 @@ const INDEX_HTML: &str = r#"<!doctype html>
       </select>
     </div>
     <div class="row">
-      <input id="gprompt" placeholder="Ask Gemini or describe a TV dashboard shelf..."/>
+      <button id="micbtn" onclick="toggleMic()">🎤 Tap to Speak (Voice Chat)</button>
     </div>
     <div class="row">
-      <button onclick="post('/api/gemini-ask',document.getElementById('gprompt').value)">✨ Ask on TV</button>
+      <input id="gprompt" placeholder="Or type a question / TV dashboard shelf..."/>
+    </div>
+    <div class="row">
+      <button class="sec" onclick="post('/api/gemini-ask',document.getElementById('gprompt').value)">✨ Ask Text</button>
       <button class="sec" onclick="post('/api/gemini-a2ui',document.getElementById('gprompt').value)">🧩 Build A2UI Shelf</button>
     </div>
   </div>
@@ -104,6 +109,13 @@ const INDEX_HTML: &str = r#"<!doctype html>
       <button class="sec" onclick="post('/api/scene','AuroraBorealis')">Aurora Shader</button>
       <button class="sec" onclick="post('/api/scene','LiquidMesh')">Liquid Mesh</button>
       <button class="sec" onclick="post('/api/scene','DeepSpace')">Deep Space</button>
+    </div>
+    <div class="row">
+      <button class="sec" onclick="post('/api/screensaver-style','Classic')">SS: Classic</button>
+      <button class="sec" onclick="post('/api/screensaver-style','GlassCard')">SS: Glass</button>
+      <button class="sec" onclick="post('/api/screensaver-style','MinimalClock')">SS: Minimal</button>
+      <button class="sec" onclick="post('/api/screensaver-style','EditorialSplit')">SS: Split</button>
+      <button class="sec" onclick="post('/api/screensaver-style','NeonRing')">SS: Neon Dial</button>
     </div>
   </div>
 
@@ -141,6 +153,35 @@ async function restoreCfg(){
   const txt=document.getElementById('cfg').value.trim();
   if(!txt){toast('Paste JSON first');return;}
   await post('/api/import-config',txt);
+}
+let mediaRec=null,micChunks=[];
+async function toggleMic(){
+  const btn=document.getElementById('micbtn');
+  if(mediaRec&&mediaRec.state==='recording'){
+    mediaRec.stop();
+    return;
+  }
+  if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){
+    toast('Use HTTPS or TV mic for voice capture');return;
+  }
+  try{
+    const stream=await navigator.mediaDevices.getUserMedia({audio:true});
+    micChunks=[];
+    mediaRec=new MediaRecorder(stream);
+    mediaRec.ondataavailable=e=>{if(e.data.size>0)micChunks.push(e.data);};
+    mediaRec.onstop=async()=>{
+      stream.getTracks().forEach(t=>t.stop());
+      btn.textContent='🎤 Tap to Speak (Voice Chat)';
+      const mime=(mediaRec.mimeType||'audio/webm').split(';')[0];
+      const blob=new Blob(micChunks,{type:mime});
+      toast('Sending voice to Gemini on TV...');
+      const r=await fetch('/api/gemini-voice',{method:'POST',headers:{'Content-Type':mime},body:await blob.arrayBuffer()});
+      toast(await r.text());
+    };
+    mediaRec.start();
+    btn.textContent='⏹ Tap to Send Voice...';
+    toast('Listening...');
+  }catch(err){toast('Mic error: '+err.message);}
 }
 </script>
 </body>
@@ -196,6 +237,7 @@ fn handle_client(
     let path = parts.next().unwrap_or("/");
 
     let mut content_len: usize = 0;
+    let mut content_type = String::from("application/octet-stream");
     loop {
         let mut h = String::new();
         if reader.read_line(&mut h).unwrap_or(0) == 0 {
@@ -208,6 +250,8 @@ fn handle_client(
         if let Some((k, v)) = trimmed.split_once(':') {
             if k.eq_ignore_ascii_case("Content-Length") {
                 content_len = v.trim().parse().unwrap_or(0);
+            } else if k.eq_ignore_ascii_case("Content-Type") {
+                content_type = v.trim().split(';').next().unwrap_or("audio/webm").trim().to_string();
             }
         }
     }
@@ -277,6 +321,17 @@ fn handle_client(
             ctx.request_repaint();
             respond(&mut stream, "200 OK", "text/plain", format!("Wallpaper -> {s}").as_bytes());
         }
+        ("POST", "/api/screensaver-style") => {
+            let s = String::from_utf8_lossy(&body).trim().to_string();
+            let _ = tx.send(WebCmd::SetScreensaverStyle(s.clone()));
+            ctx.request_repaint();
+            respond(
+                &mut stream,
+                "200 OK",
+                "text/plain",
+                format!("Screensaver style -> {s}").as_bytes(),
+            );
+        }
         ("POST", "/api/wallpaper") => {
             if body.len() < 1024 {
                 respond(&mut stream, "400 Bad Request", "text/plain", b"Image too small");
@@ -321,6 +376,20 @@ fn handle_client(
                 let _ = tx.send(WebCmd::AskGemini(prompt));
                 ctx.request_repaint();
                 respond(&mut stream, "200 OK", "text/plain", b"Asking Gemini on TV...");
+            }
+        }
+        ("POST", "/api/gemini-voice") => {
+            if body.len() < 800 {
+                respond(&mut stream, "400 Bad Request", "text/plain", b"Voice clip too short");
+            } else {
+                let mime = if content_type.starts_with("audio/") {
+                    content_type
+                } else {
+                    "audio/webm".to_string()
+                };
+                let _ = tx.send(WebCmd::AskGeminiVoice(body, mime));
+                ctx.request_repaint();
+                respond(&mut stream, "200 OK", "text/plain", b"Gemini Voice processing on TV...");
             }
         }
         ("POST", "/api/gemini-a2ui") => {

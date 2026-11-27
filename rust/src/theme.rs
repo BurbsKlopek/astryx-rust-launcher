@@ -213,6 +213,38 @@ pub enum FocusAnimStyle {
     Minimal,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum ScreensaverStyle {
+    #[default]
+    Classic,
+    GlassCard,
+    MinimalClock,
+    EditorialSplit,
+    NeonRing,
+}
+
+impl ScreensaverStyle {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Classic => "Classic Bold",
+            Self::GlassCard => "Frosted Glass",
+            Self::MinimalClock => "Minimal Time",
+            Self::EditorialSplit => "Editorial Split",
+            Self::NeonRing => "Neon Dial",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::Classic => Self::GlassCard,
+            Self::GlassCard => Self::MinimalClock,
+            Self::MinimalClock => Self::EditorialSplit,
+            Self::EditorialSplit => Self::NeonRing,
+            Self::NeonRing => Self::Classic,
+        }
+    }
+}
+
 impl FocusAnimStyle {
     pub const ALL: [Self; 5] = [
         Self::KineticRipple,
@@ -309,6 +341,8 @@ pub struct LauncherConfig {
     #[serde(default = "default_ambient")]
     pub ambient_timeout_secs: u32,
     #[serde(default)]
+    pub screensaver_style: ScreensaverStyle,
+    #[serde(default)]
     pub auto_clear_ram_on_home: bool,
     #[serde(default = "default_true")]
     pub show_now_playing: bool,
@@ -377,6 +411,7 @@ impl Default for LauncherConfig {
             weather_lat: default_lat(),
             weather_lon: default_lon(),
             ambient_timeout_secs: default_ambient(),
+            screensaver_style: ScreensaverStyle::Classic,
             auto_clear_ram_on_home: false,
             show_now_playing: true,
             web_companion_enabled: true,

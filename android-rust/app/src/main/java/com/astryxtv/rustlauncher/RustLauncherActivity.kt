@@ -1,5 +1,6 @@
 package com.astryxtv.rustlauncher
 
+import android.Manifest
 import android.app.ActivityManager
 import android.app.NativeActivity
 import android.app.PendingIntent
@@ -11,11 +12,22 @@ import android.content.IntentFilter
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageInstaller
 import android.content.pm.PackageManager
+import android.media.AudioAttributes
+import android.media.AudioFormat
 import android.media.AudioManager
+import android.media.AudioRecord
+import android.media.AudioTrack
+import android.media.MediaRecorder
+import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
 import java.io.File
 import java.io.FileInputStream
 import java.net.Inet4Address
 import java.net.NetworkInterface
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.util.Locale
+import kotlin.math.sqrt
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.drawable.BitmapDrawable
@@ -61,6 +73,7 @@ class RustLauncherActivity : NativeActivity() {
 
     private external fun nativeOnBackPressed()
     private external fun nativeOnMenuPressed()
+    private external fun nativeOnHomePressed()
     private external fun nativeOnStatusChanged()
     private external fun nativeOnPackagesChanged()
     private external fun nativeOnPaused()
@@ -143,17 +156,35 @@ class RustLauncherActivity : NativeActivity() {
         notifyStatusChanged()
     }
 
+    override fun onNewIntent(intent: Intent?) {
+        super.onNewIntent(intent)
+        if (intent?.hasCategory(Intent.CATEGORY_HOME) == true) {
+            try {
+                nativeOnHomePressed()
+            } catch (_: UnsatisfiedLinkError) {
+            }
+        }
+    }
+
     override fun onPause() {
+        rustStopVoiceSession()
         notifyPaused()
         super.onPause()
     }
 
     override fun onStop() {
+        rustStopVoiceSession()
         notifyPaused()
         super.onStop()
     }
 
     override fun onDestroy() {
+        rustStopVoiceSession()
+        try {
+            ttsEngine?.shutdown()
+            ttsEngine = null
+        } catch (_: Throwable) {
+        }
         unregisterPackageWatcher()
         unregisterNetworkWatcher()
         super.onDestroy()
@@ -856,5 +887,411 @@ class RustLauncherActivity : NativeActivity() {
         } catch (t: Throwable) {
             "ERR:${t.message ?: t.javaClass.simpleName}"
         }
+    }
+
+    // =========================================================================
+    // Native Gemini Voice Capture (16kHz PCM -> WAV + VAD) & Expressive Audio Playback
+    // =========================================================================
+
+    @Volatile private var isRecordingVoice = false
+    @Volatile private var voiceAutoStopped = false
+    @Volatile private var currentMicLevel = 0f
+    @Volatile private var recordedWavBytes: ByteArray = ByteArray(0)
+    private var recordThread: Thread? = null
+
+    @Volatile private var isPlayingSpeech = false
+    @Volatile private var stopSpeechRequested = false
+    @Volatile private var currentSpeakLevel = 0f
+    private var activeAudioTrack: AudioTrack? = null
+    private var ttsEngine: TextToSpeech? = null
+    @Volatile private var ttsReady = false
+
+    private fun ensureTts() {
+        if (ttsEngine != null) return
+        runOnUiThread {
+            try {
+                if (ttsEngine == null) {
+                    ttsEngine = TextToSpeech(applicationContext) { status ->
+                        if (status == TextToSpeech.SUCCESS) {
+                            ttsEngine?.language = Locale.UK
+                            ttsEngine?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                                override fun onStart(utteranceId: String?) {
+                                    isPlayingSpeech = true
+                                    currentSpeakLevel = 0.55f
+                                }
+                                override fun onDone(utteranceId: String?) {
+                                    isPlayingSpeech = false
+                                    currentSpeakLevel = 0f
+                                }
+                                @Deprecated("Deprecated in Java")
+                                override fun onError(utteranceId: String?) {
+                                    isPlayingSpeech = false
+                                    currentSpeakLevel = 0f
+                                }
+                            })
+                            ttsReady = true
+                        }
+                    }
+                }
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
+    fun rustStartVoiceRecording(): String {
+        return try {
+            if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                runOnUiThread {
+                    try {
+                        requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 901)
+                    } catch (_: Throwable) {
+                    }
+                }
+                return "NEED_MIC_PERMISSION"
+            }
+            rustStopSpeaking()
+            if (isRecordingVoice) {
+                return "OK"
+            }
+
+            val sampleRate = 16_000
+            val minBuf = AudioRecord.getMinBufferSize(
+                sampleRate,
+                AudioFormat.CHANNEL_IN_MONO,
+                AudioFormat.ENCODING_PCM_16BIT
+            ).coerceAtLeast(3200)
+
+            var recorder: AudioRecord? = null
+            val sources = intArrayOf(
+                MediaRecorder.AudioSource.VOICE_RECOGNITION,
+                MediaRecorder.AudioSource.MIC,
+                MediaRecorder.AudioSource.DEFAULT
+            )
+            for (src in sources) {
+                try {
+                    val r = AudioRecord(
+                        src,
+                        sampleRate,
+                        AudioFormat.CHANNEL_IN_MONO,
+                        AudioFormat.ENCODING_PCM_16BIT,
+                        minBuf * 2
+                    )
+                    if (r.state == AudioRecord.STATE_INITIALIZED) {
+                        recorder = r
+                        break
+                    } else {
+                        r.release()
+                    }
+                } catch (_: Throwable) {
+                }
+            }
+            val rec = recorder ?: return "ERR:No microphone found (connect BT mic/earbuds or use Phone Companion)"
+
+            // Route Bluetooth headset/remote SCO mic if available
+            val am = getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+            var scoStarted = false
+            try {
+                if (am != null && am.isBluetoothScoAvailableOffCall && !am.isBluetoothScoOn) {
+                    @Suppress("DEPRECATION")
+                    am.startBluetoothSco()
+                    @Suppress("DEPRECATION")
+                    am.isBluetoothScoOn = true
+                    scoStarted = true
+                }
+            } catch (_: Throwable) {
+            }
+
+            recordedWavBytes = ByteArray(0)
+            voiceAutoStopped = false
+            currentMicLevel = 0f
+            isRecordingVoice = true
+
+            recordThread = Thread {
+                val pcmOut = ByteArrayOutputStream(sampleRate * 2 * 8)
+                val shortBuf = ShortArray(1024)
+                val byteChunk = ByteArray(2048)
+                var heardSpeech = false
+                var speechFrames = 0
+                var silenceSince = 0L
+                val startedAt = System.currentTimeMillis()
+
+                try {
+                    rec.startRecording()
+                    while (isRecordingVoice) {
+                        val n = rec.read(shortBuf, 0, shortBuf.size)
+                        if (n > 0) {
+                            var sumSq = 0.0
+                            for (i in 0 until n) {
+                                val s = shortBuf[i].toInt()
+                                byteChunk[i * 2] = (s and 0xFF).toByte()
+                                byteChunk[i * 2 + 1] = ((s shr 8) and 0xFF).toByte()
+                                val norm = s / 32768.0
+                                sumSq += norm * norm
+                            }
+                            pcmOut.write(byteChunk, 0, n * 2)
+
+                            val rms = sqrt(sumSq / n).toFloat()
+                            val boosted = (rms * 5.2f).coerceIn(0f, 1f)
+                            currentMicLevel = currentMicLevel * 0.55f + boosted * 0.45f
+
+                            val now = System.currentTimeMillis()
+                            if (boosted > 0.11f) {
+                                speechFrames++
+                                if (speechFrames >= 4) {
+                                    heardSpeech = true
+                                }
+                                silenceSince = 0L
+                            } else if (heardSpeech) {
+                                if (silenceSince == 0L) {
+                                    silenceSince = now
+                                } else if (now - silenceSince >= 1250L) {
+                                    voiceAutoStopped = true
+                                    isRecordingVoice = false
+                                    break
+                                }
+                            }
+                            if (now - startedAt >= 12_000L) {
+                                voiceAutoStopped = true
+                                isRecordingVoice = false
+                                break
+                            }
+                        } else {
+                            Thread.sleep(15)
+                        }
+                    }
+                } catch (_: Throwable) {
+                } finally {
+                    currentMicLevel = 0f
+                    isRecordingVoice = false
+                    try {
+                        rec.stop()
+                    } catch (_: Throwable) {
+                    }
+                    try {
+                        rec.release()
+                    } catch (_: Throwable) {
+                    }
+                    if (scoStarted) {
+                        try {
+                            @Suppress("DEPRECATION")
+                            am?.isBluetoothScoOn = false
+                            @Suppress("DEPRECATION")
+                            am?.stopBluetoothSco()
+                        } catch (_: Throwable) {
+                        }
+                    }
+                    val pcm = pcmOut.toByteArray()
+                    if (pcm.size >= 1600) {
+                        recordedWavBytes = wrapPcmAsWav(pcm, sampleRate, 1, 16)
+                    }
+                }
+            }.apply {
+                name = "astryx-voice-rec"
+                isDaemon = true
+                start()
+            }
+            ensureTts()
+            "OK"
+        } catch (t: Throwable) {
+            isRecordingVoice = false
+            "ERR:${t.message ?: t.javaClass.simpleName}"
+        }
+    }
+
+    fun rustStopVoiceRecording(): ByteArray {
+        isRecordingVoice = false
+        try {
+            recordThread?.join(600)
+        } catch (_: Throwable) {
+        }
+        recordThread = null
+        currentMicLevel = 0f
+        voiceAutoStopped = false
+        val out = recordedWavBytes
+        recordedWavBytes = ByteArray(0)
+        return out
+    }
+
+    fun rustIsVoiceRecording(): Boolean = isRecordingVoice
+
+    fun rustIsVoiceAutoStopped(): Boolean = voiceAutoStopped
+
+    fun rustGetVoiceLevel(): Float = currentMicLevel
+
+    private fun wrapPcmAsWav(pcm: ByteArray, sampleRate: Int, channels: Int, bitsPerSample: Int): ByteArray {
+        val byteRate = sampleRate * channels * (bitsPerSample / 8)
+        val blockAlign = (channels * (bitsPerSample / 8)).toShort()
+        val out = ByteBuffer.allocate(44 + pcm.size).order(ByteOrder.LITTLE_ENDIAN)
+        out.put("RIFF".toByteArray(Charsets.US_ASCII))
+        out.putInt(36 + pcm.size)
+        out.put("WAVE".toByteArray(Charsets.US_ASCII))
+        out.put("fmt ".toByteArray(Charsets.US_ASCII))
+        out.putInt(16)
+        out.putShort(1) // PCM
+        out.putShort(channels.toShort())
+        out.putInt(sampleRate)
+        out.putInt(byteRate)
+        out.putShort(blockAlign)
+        out.putShort(bitsPerSample.toShort())
+        out.put("data".toByteArray(Charsets.US_ASCII))
+        out.putInt(pcm.size)
+        out.put(pcm)
+        return out.array()
+    }
+
+    fun rustPlayWavBytes(wav: ByteArray): Boolean {
+        if (wav.size < 48) return false
+        return try {
+            rustStopSpeaking()
+            val bb = ByteBuffer.wrap(wav).order(ByteOrder.LITTLE_ENDIAN)
+            if (wav[0] != 'R'.code.toByte() || wav[1] != 'I'.code.toByte()) return false
+            var pos = 12
+            var sampleRate = 24_000
+            var channels = 1
+            var dataStart = -1
+            var dataLen = 0
+            while (pos + 8 <= wav.size) {
+                val c0 = wav[pos].toInt().toChar()
+                val c1 = wav[pos + 1].toInt().toChar()
+                val c2 = wav[pos + 2].toInt().toChar()
+                val c3 = wav[pos + 3].toInt().toChar()
+                val chunkSize = bb.getInt(pos + 4)
+                val chunkData = pos + 8
+                if (c0 == 'f' && c1 == 'm' && c2 == 't' && c3 == ' ' && chunkData + 16 <= wav.size) {
+                    channels = bb.getShort(chunkData + 2).toInt().coerceIn(1, 2)
+                    sampleRate = bb.getInt(chunkData + 4).coerceIn(8_000, 48_000)
+                } else if (c0 == 'd' && c1 == 'a' && c2 == 't' && c3 == 'a') {
+                    dataStart = chunkData
+                    dataLen = chunkSize.coerceAtMost(wav.size - chunkData)
+                    break
+                }
+                if (chunkSize < 0) break
+                pos = chunkData + chunkSize + (chunkSize and 1)
+            }
+            if (dataStart < 0 || dataLen <= 0) return false
+
+            val chMask = if (channels == 2) AudioFormat.CHANNEL_OUT_STEREO else AudioFormat.CHANNEL_OUT_MONO
+            val minBuf = AudioTrack.getMinBufferSize(sampleRate, chMask, AudioFormat.ENCODING_PCM_16BIT)
+                .coerceAtLeast(4096)
+
+            val track = AudioTrack.Builder()
+                .setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                        .build()
+                )
+                .setAudioFormat(
+                    AudioFormat.Builder()
+                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                        .setSampleRate(sampleRate)
+                        .setChannelMask(chMask)
+                        .build()
+                )
+                .setBufferSizeInBytes(minBuf * 2)
+                .setTransferMode(AudioTrack.MODE_STREAM)
+                .build()
+
+            activeAudioTrack = track
+            stopSpeechRequested = false
+            isPlayingSpeech = true
+
+            Thread {
+                try {
+                    track.play()
+                    var offset = dataStart
+                    val end = dataStart + dataLen
+                    val step = 2048
+                    while (offset < end && !stopSpeechRequested) {
+                        val n = (end - offset).coerceAtMost(step)
+                        var sumSq = 0.0
+                        val samples = n / 2
+                        if (samples > 0) {
+                            for (i in 0 until samples) {
+                                val lo = wav[offset + i * 2].toInt() and 0xFF
+                                val hi = wav[offset + i * 2 + 1].toInt()
+                                val s = ((hi shl 8) or lo).toShort().toInt()
+                                val norm = s / 32768.0
+                                sumSq += norm * norm
+                            }
+                            val rms = sqrt(sumSq / samples).toFloat()
+                            currentSpeakLevel = currentSpeakLevel * 0.5f + (rms * 4.2f).coerceIn(0.08f, 1f) * 0.5f
+                        }
+                        val written = track.write(wav, offset, n)
+                        if (written <= 0) break
+                        offset += written
+                    }
+                } catch (_: Throwable) {
+                } finally {
+                    currentSpeakLevel = 0f
+                    isPlayingSpeech = false
+                    try {
+                        track.stop()
+                    } catch (_: Throwable) {
+                    }
+                    try {
+                        track.release()
+                    } catch (_: Throwable) {
+                    }
+                    if (activeAudioTrack === track) {
+                        activeAudioTrack = null
+                    }
+                }
+            }.apply {
+                name = "astryx-tts-play"
+                isDaemon = true
+                start()
+            }
+            true
+        } catch (_: Throwable) {
+            isPlayingSpeech = false
+            currentSpeakLevel = 0f
+            false
+        }
+    }
+
+    fun rustSpeakFallbackTts(text: String) {
+        ensureTts()
+        runOnUiThread {
+            try {
+                if (ttsReady) {
+                    ttsEngine?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "gemini_reply")
+                }
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
+    fun rustStopSpeaking() {
+        stopSpeechRequested = true
+        isPlayingSpeech = false
+        currentSpeakLevel = 0f
+        try {
+            activeAudioTrack?.pause()
+            activeAudioTrack?.flush()
+            activeAudioTrack?.stop()
+        } catch (_: Throwable) {
+        }
+        try {
+            ttsEngine?.stop()
+        } catch (_: Throwable) {
+        }
+    }
+
+    fun rustStopVoiceSession() {
+        isRecordingVoice = false
+        rustStopSpeaking()
+    }
+
+    fun rustIsSpeaking(): Boolean = isPlayingSpeech
+
+    fun rustGetSpeakLevel(): Float {
+        if (!isPlayingSpeech) return 0f
+        // If using system TTS fallback where PCM isn't directly sampled, synthesize smooth speech cadence
+        if (activeAudioTrack == null) {
+            val t = System.currentTimeMillis() / 110.0
+            return (0.35 + 0.35 * kotlin.math.sin(t) * kotlin.math.cos(t * 1.7)).toFloat().coerceIn(0.1f, 0.85f)
+        }
+        return currentSpeakLevel
     }
 }

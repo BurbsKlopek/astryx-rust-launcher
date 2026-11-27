@@ -3,7 +3,8 @@ use crate::bridge::{self, TvAppInfo, TvSystemStatus};
 use crate::gemini;
 use crate::theme::{
     AppFolder, AstryxThemeId, FocusAnimStyle, IconSize, LauncherConfig, LayoutStyle,
-    SettingsViewMode, SortOrder, StartupMode, WeatherScene, ACCENT_PRESETS, WEATHER_CITY_PRESETS,
+    ScreensaverStyle, SettingsViewMode, SortOrder, StartupMode, WeatherScene, ACCENT_PRESETS,
+    WEATHER_CITY_PRESETS,
 };
 use crate::updater::{self, ReleaseInfo, UpdateCheckOutcome};
 use crate::weather::{self, WeatherData};
@@ -84,9 +85,18 @@ enum ActiveModal {
     Backup,
     StartupOptions,
     Search,
+    Gemini,
+    GeminiSettings,
     A2ui,
     AppContext(String), // package_name
     RenameApp(String),  // package_name
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsZone {
+    Ribbon,   // Top Cinema Ribbon: 0..5 category tabs, 5 = Close button
+    List,     // Left 60% settings list
+    QuickBar, // Bottom-right Android TV shortcuts (0..4) & Boost RAM (4)
 }
 
 pub struct AstryxTvApp {
@@ -111,7 +121,7 @@ pub struct AstryxTvApp {
     wallpaper_tex: Option<(WeatherScene, u8, TextureHandle)>,
     wallpaper_loading: Option<(WeatherScene, u8)>,
 
-    // A2UI & Gemini AI
+    // A2UI & Gemini AI (Voice-First by default)
     a2ui: A2uiEngine,
     a2ui_input: String,
     a2ui_feedback: String,
@@ -119,6 +129,8 @@ pub struct AstryxTvApp {
     gemini_reply: String,
     gemini_last_id: Option<String>,
     gemini_busy: bool,
+    gemini_text_mode: bool,
+    gemini_listening: bool,
 
     // Internal OTA Updater
     app_version: String,
@@ -144,6 +156,9 @@ pub struct AstryxTvApp {
     modal_opened_at: Instant,
     last_back_handled: Instant,
     last_sat_refresh: Instant,
+    settings_tab: usize,
+    settings_zone: SettingsZone,
+    settings_ribbon_focus: usize,
     settings_sys_col: usize,
     select_down_since: Option<Instant>,
     select_long_triggered: bool,
@@ -258,6 +273,8 @@ impl AstryxTvApp {
             gemini_reply: String::new(),
             gemini_last_id: None,
             gemini_busy: false,
+            gemini_text_mode: false,
+            gemini_listening: false,
             app_version: bridge::get_app_version(),
             display_hz: bridge::get_refresh_rate(),
             fps_frame_count: 0,
@@ -283,6 +300,9 @@ impl AstryxTvApp {
             modal_opened_at: now,
             last_back_handled: now - Duration::from_secs(2),
             last_sat_refresh: now,
+            settings_tab: 0,
+            settings_zone: SettingsZone::List,
+            settings_ribbon_focus: 0,
             settings_sys_col: 0,
             select_down_since: None,
             select_long_triggered: false,
@@ -392,6 +412,11 @@ impl AstryxTvApp {
     }
 
     fn open_modal(&mut self, modal: ActiveModal) {
+        if modal == ActiveModal::Settings && self.modal == ActiveModal::None {
+            self.settings_tab = 0;
+            self.settings_zone = SettingsZone::List;
+            self.settings_ribbon_focus = 0;
+        }
         if modal == ActiveModal::None {
             self.modal_stack.clear();
         } else if self.modal != ActiveModal::None && self.modal != modal {
@@ -411,8 +436,18 @@ impl AstryxTvApp {
             self.config.onboarding_done = true;
             self.save_config();
         }
+        if self.modal == ActiveModal::Gemini {
+            if self.gemini_listening {
+                let _ = bridge::stop_voice_recording();
+                self.gemini_listening = false;
+            }
+            bridge::stop_speaking();
+        }
         self.modal_close_focused = false;
         if let Some((prev_modal, prev_focus)) = self.modal_stack.pop() {
+            if prev_modal == ActiveModal::Settings {
+                self.settings_zone = SettingsZone::List;
+            }
             self.modal = prev_modal;
             self.modal_focus = prev_focus;
             self.modal_just_opened = true;
@@ -751,9 +786,23 @@ impl AstryxTvApp {
                             if !reply.interaction_id.is_empty() {
                                 self.gemini_last_id = Some(reply.interaction_id);
                             }
+                            let text_copy = reply.text.clone();
                             self.gemini_reply = reply.text;
-                            self.a2ui_feedback =
-                                format!("✓ Gemini ({}) replied", self.config.gemini_model);
+                            if !self.gemini_text_mode {
+                                let played = reply
+                                    .tts_wav
+                                    .as_deref()
+                                    .map(bridge::play_wav_bytes)
+                                    .unwrap_or(false);
+                                if !played {
+                                    bridge::speak_fallback_tts(&text_copy);
+                                }
+                                self.a2ui_feedback =
+                                    format!("🔊 Speaking ({})", self.config.gemini_model);
+                            } else {
+                                self.a2ui_feedback =
+                                    format!("✓ Gemini ({}) replied", self.config.gemini_model);
+                            }
                         }
                         Err(e) => {
                             self.a2ui_feedback = format!("Gemini error: {e}");
@@ -880,8 +929,17 @@ impl AstryxTvApp {
                         self.show_toast("Gemini AI is disabled in Settings");
                     } else {
                         self.gemini_prompt = prompt.clone();
-                        self.open_modal(ActiveModal::A2ui);
+                        self.open_modal(ActiveModal::Gemini);
                         self.spawn_ask_gemini(ctx.clone(), prompt);
+                    }
+                }
+                WebCmd::AskGeminiVoice(audio_bytes, mime) => {
+                    if !self.config.gemini_enabled {
+                        self.show_toast("Gemini AI is disabled in Settings");
+                    } else {
+                        self.gemini_text_mode = false;
+                        self.open_modal(ActiveModal::Gemini);
+                        self.spawn_ask_gemini_voice(ctx.clone(), audio_bytes, mime);
                     }
                 }
                 WebCmd::GeminiA2ui(prompt) => {
@@ -891,6 +949,20 @@ impl AstryxTvApp {
                         self.gemini_prompt = prompt.clone();
                         self.spawn_gemini_a2ui(ctx.clone(), prompt);
                     }
+                }
+                WebCmd::SetScreensaverStyle(name) => {
+                    self.config.screensaver_style = match name.as_str() {
+                        "GlassCard" => ScreensaverStyle::GlassCard,
+                        "MinimalClock" => ScreensaverStyle::MinimalClock,
+                        "EditorialSplit" => ScreensaverStyle::EditorialSplit,
+                        "NeonRing" => ScreensaverStyle::NeonRing,
+                        _ => ScreensaverStyle::Classic,
+                    };
+                    self.save_config();
+                    self.show_toast(format!(
+                        "Screensaver Style: {}",
+                        self.config.screensaver_style.label()
+                    ));
                 }
                 WebCmd::ImportConfigJson(json) => {
                     if let Ok(cfg) = serde_json::from_str::<LauncherConfig>(&json) {
@@ -927,7 +999,41 @@ impl AstryxTvApp {
         )
     }
 
-    fn spawn_ask_gemini(&mut self, ctx: egui::Context, prompt: String) {
+    fn start_gemini_voice_listen(&mut self) {
+        if !self.config.gemini_enabled {
+            self.a2ui_feedback = "Gemini AI is disabled in Settings".to_string();
+            return;
+        }
+        if self.config.gemini_api_key.trim().is_empty() {
+            self.a2ui_feedback =
+                "Add your Gemini API key via Phone Companion first".to_string();
+            return;
+        }
+        bridge::stop_speaking();
+        let status = bridge::start_voice_recording();
+        if status == "OK" {
+            self.gemini_listening = true;
+            self.a2ui_feedback = "🎤 Listening — speak now (auto-sends on pause, or press OK)".to_string();
+        } else if status == "NEED_MIC_PERMISSION" {
+            self.gemini_listening = false;
+            self.a2ui_feedback = "Allow microphone access on TV, then press Speak again".to_string();
+        } else {
+            self.gemini_listening = false;
+            self.a2ui_feedback = status.trim_start_matches("ERR:").to_string();
+        }
+    }
+
+    fn finish_gemini_voice_listen(&mut self, ctx: egui::Context) {
+        self.gemini_listening = false;
+        let wav = bridge::stop_voice_recording();
+        if wav.len() < 800 {
+            self.a2ui_feedback = "Didn't catch that — press Speak and talk closer to the mic".to_string();
+            return;
+        }
+        self.spawn_ask_gemini_voice(ctx, wav, "audio/wav".to_string());
+    }
+
+    fn spawn_ask_gemini_voice(&mut self, ctx: egui::Context, audio: Vec<u8>, mime: String) {
         if !self.config.gemini_enabled {
             self.a2ui_feedback = "Gemini AI is disabled in Settings".to_string();
             self.show_toast("Gemini AI is disabled in Settings");
@@ -942,7 +1048,39 @@ impl AstryxTvApp {
         let tv_ctx = self.tv_context_summary();
         let tx = self.tx.clone();
         self.gemini_busy = true;
-        self.a2ui_feedback = format!("✨ Asking Gemini ({model})...");
+        self.a2ui_feedback = format!("✦ Gemini ({model}) processing voice...");
+        std::thread::spawn(move || {
+            let res = gemini::ask_tv_voice_assistant(
+                &api_key,
+                &model,
+                &audio,
+                &mime,
+                prev_id.as_deref(),
+                &tv_ctx,
+            );
+            let _ = tx.send(BgMsg::GeminiReplied(res));
+            ctx.request_repaint();
+        });
+    }
+
+    fn spawn_ask_gemini(&mut self, ctx: egui::Context, prompt: String) {
+        if !self.config.gemini_enabled {
+            self.a2ui_feedback = "Gemini AI is disabled in Settings".to_string();
+            self.show_toast("Gemini AI is disabled in Settings");
+            return;
+        }
+        if self.gemini_busy {
+            return;
+        }
+        bridge::stop_speaking();
+        let api_key = self.config.gemini_api_key.clone();
+        let model = self.config.gemini_model.clone();
+        let prev_id = self.gemini_last_id.clone();
+        let tv_ctx = self.tv_context_summary();
+        let with_tts = !self.gemini_text_mode;
+        let tx = self.tx.clone();
+        self.gemini_busy = true;
+        self.a2ui_feedback = format!("✦ Gemini ({model}) thinking...");
         std::thread::spawn(move || {
             let res = gemini::ask_tv_assistant(
                 &api_key,
@@ -950,6 +1088,7 @@ impl AstryxTvApp {
                 &prompt,
                 prev_id.as_deref(),
                 &tv_ctx,
+                with_tts,
             );
             let _ = tx.send(BgMsg::GeminiReplied(res));
             ctx.request_repaint();
@@ -1231,6 +1370,8 @@ impl AstryxTvApp {
             return;
         }
 
+        let dock = self.dock_items();
+        let dock_last = dock.len().saturating_sub(1);
         let has_weather = self.config.show_header && self.config.show_weather;
         let has_favs = !favs.is_empty();
         let app_len = visible.len();
@@ -1239,16 +1380,11 @@ impl AstryxTvApp {
 
         if select {
             match &self.focus {
-                FocusTarget::Dock(idx) => match idx {
-                    0 => bridge::open_system_settings("network"),
-                    1 => self.open_vpn_app(),
-                    2 => self.open_modal(ActiveModal::Search),
-                    3 => self.open_modal(ActiveModal::Theme),
-                    4 => self.open_modal(ActiveModal::A2ui),
-                    5 => self.force_refresh_all(ctx),
-                    6 => self.open_modal(ActiveModal::Settings),
-                    _ => {}
-                },
+                FocusTarget::Dock(pos) => {
+                    if let Some(&(action_id, _)) = dock.get(*pos) {
+                        self.trigger_dock_action(action_id, ctx);
+                    }
+                }
                 FocusTarget::Weather => self.open_modal(ActiveModal::Weather),
                 FocusTarget::Fav(i) => {
                     if let Some(a) = favs.get(*i) {
@@ -1290,16 +1426,17 @@ impl AstryxTvApp {
 
         match self.focus.clone() {
             FocusTarget::Dock(i) => {
+                let cur = i.min(dock_last);
                 if left {
-                    if i > 0 {
-                        self.focus = FocusTarget::Dock(i - 1);
+                    if cur > 0 {
+                        self.focus = FocusTarget::Dock(cur - 1);
                     } else if is_zenith && has_weather {
                         // In Zenith unified top bar, Weather sits directly left of Wi-Fi
                         self.focus = FocusTarget::Weather;
                     }
                     // In Classic mode, Left on Wi-Fi (0) stops strictly at edge!
                 } else if right {
-                    self.focus = FocusTarget::Dock((i + 1).min(6));
+                    self.focus = FocusTarget::Dock((cur + 1).min(dock_last));
                 } else if down {
                     if is_zenith {
                         if app_len > 0 {
@@ -1322,7 +1459,7 @@ impl AstryxTvApp {
                         self.focus = FocusTarget::App(0);
                     }
                 } else if up {
-                    self.focus = FocusTarget::Dock(6);
+                    self.focus = FocusTarget::Dock(dock_last);
                 } else if down {
                     if has_favs {
                         self.focus = FocusTarget::Fav(0);
@@ -1383,7 +1520,7 @@ impl AstryxTvApp {
                         } else if has_weather {
                             self.focus = FocusTarget::Weather;
                         } else {
-                            self.focus = FocusTarget::Dock(col.min(6));
+                            self.focus = FocusTarget::Dock(col.min(dock_last));
                         }
                     } else if down {
                         if row + 1 < total_rows {
@@ -2223,9 +2360,284 @@ impl AstryxTvApp {
             200 => Self::draw_dock_icon(p, c, 0, color),
             // Apps shortcut: 4-square grid
             201 => Self::draw_dock_icon(p, c, 3, color),
+            // Gemini AI sparkle shortcut
+            203 => Self::draw_dock_icon(p, c, 7, color),
             // System Settings shortcut: cog
             _ => Self::draw_dock_icon(p, c, 6, color),
         }
+    }
+
+    fn dock_items(&self) -> Vec<(usize, &'static str)> {
+        if self.config.gemini_enabled {
+            vec![
+                (0, "Wi-Fi"),
+                (1, "VPN"),
+                (2, "Search"),
+                (7, "Gemini AI"),
+                (3, "Theme"),
+                (4, "A2UI"),
+                (5, "Refresh"),
+                (6, "Settings"),
+            ]
+        } else {
+            vec![
+                (0, "Wi-Fi"),
+                (1, "VPN"),
+                (2, "Search"),
+                (3, "Theme"),
+                (4, "A2UI"),
+                (5, "Refresh"),
+                (6, "Settings"),
+            ]
+        }
+    }
+
+    fn trigger_dock_action(&mut self, action_id: usize, ctx: &egui::Context) {
+        match action_id {
+            0 => bridge::open_system_settings("network"),
+            1 => self.open_vpn_app(),
+            2 => self.open_modal(ActiveModal::Search),
+            3 => self.open_modal(ActiveModal::Theme),
+            4 => self.open_modal(ActiveModal::A2ui),
+            5 => self.force_refresh_all(ctx),
+            6 => self.open_modal(ActiveModal::Settings),
+            7 => {
+                self.gemini_text_mode = false;
+                self.open_modal(ActiveModal::Gemini);
+                if !self.config.gemini_api_key.trim().is_empty() && !self.gemini_busy {
+                    self.start_gemini_voice_listen();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn draw_gemini_sparkle(painter: &egui::Painter, c: Pos2, radius: f32, color: Color32) {
+        let waist = radius * 0.27;
+        let vert = vec![
+            c + Vec2::new(0.0, -radius),
+            c + Vec2::new(waist, 0.0),
+            c + Vec2::new(0.0, radius),
+            c + Vec2::new(-waist, 0.0),
+        ];
+        let horiz = vec![
+            c + Vec2::new(-radius, 0.0),
+            c + Vec2::new(0.0, -waist),
+            c + Vec2::new(radius, 0.0),
+            c + Vec2::new(0.0, waist),
+        ];
+        painter.add(egui::Shape::convex_polygon(vert, color, Stroke::NONE));
+        painter.add(egui::Shape::convex_polygon(horiz, color, Stroke::NONE));
+        painter.circle_filled(c, waist * 1.05, color);
+    }
+
+    fn draw_gemini_voice_orb(
+        &self,
+        ui: &mut Ui,
+        ctx: &egui::Context,
+        listening: bool,
+        thinking: bool,
+        speaking: bool,
+        audio_level: f32,
+    ) -> egui::Response {
+        let t = self.start_time.elapsed().as_secs_f32();
+        let accent = self.config.accent();
+        let accent2 = self.config.accent2();
+        let live_c = if listening {
+            Color32::from_rgb(52, 211, 153) // Emerald-cyan live mic
+        } else if thinking {
+            Color32::from_rgb(168, 85, 247) // Violet reasoning vortex
+        } else if speaking {
+            accent
+        } else {
+            accent
+        };
+
+        let energy = if listening {
+            0.30 + audio_level.clamp(0.0, 1.0) * 0.85
+        } else if speaking {
+            0.28 + audio_level.clamp(0.0, 1.0) * 0.80
+        } else if thinking {
+            0.55 + (t * 4.2).sin() * 0.15
+        } else {
+            0.14 + (t * 1.6).sin() * 0.04
+        };
+
+        let area_size = Vec2::new(ui.available_width(), 206.0);
+        let (rect, resp) = ui.allocate_exact_size(area_size, Sense::click());
+        let p = ui.painter();
+        let center = rect.center();
+        let base_r = 56.0_f32;
+
+        // 1. Expanding Sonar / Atmospheric Aura Rings
+        for ring_i in 0..3 {
+            let phase = ((t * (if listening || speaking { 0.85 } else { 0.42 })
+                + ring_i as f32 * 0.33)
+                % 1.0)
+                .clamp(0.0, 1.0);
+            let r = base_r + 12.0 + phase * (38.0 + energy * 24.0);
+            let alpha = ((1.0 - phase) * (42.0 + energy * 52.0)).clamp(0.0, 110.0) as u8;
+            let rc = if ring_i % 2 == 0 { live_c } else { accent2 };
+            p.circle_stroke(
+                center,
+                r,
+                Stroke::new(
+                    1.4_f32,
+                    Color32::from_rgba_unmultiplied(rc.r(), rc.g(), rc.b(), alpha),
+                ),
+            );
+        }
+
+        // 2. 28-Bar Radial Soundwave Equalizer (reacts live to mic / TTS voice level!)
+        let bar_count = 28usize;
+        for b in 0..bar_count {
+            let ang = (b as f32 / bar_count as f32) * std::f32::consts::TAU - std::f32::consts::FRAC_PI_2;
+            let dir = Vec2::new(ang.cos(), ang.sin());
+            let wave = ((ang * 4.0 + t * 7.5).sin() * 0.5 + 0.5)
+                * ((ang * 3.0 - t * 5.2).cos() * 0.5 + 0.5);
+            let bar_len = if listening || speaking {
+                4.0 + (audio_level * 26.0 + 5.0) * (0.35 + wave * 0.95)
+            } else if thinking {
+                4.0 + 10.0 * ((ang * 2.0 + t * 6.5).sin() * 0.5 + 0.5)
+            } else {
+                2.5 + 2.5 * ((ang * 3.0 + t * 1.8).sin() * 0.5 + 0.5)
+            };
+            let inner = center + dir * (base_r + 14.0);
+            let outer = center + dir * (base_r + 14.0 + bar_len);
+            let bar_alpha = if listening || speaking {
+                (115.0 + audio_level * 135.0).clamp(90.0, 250.0) as u8
+            } else if thinking {
+                145
+            } else {
+                68
+            };
+            let bc = if b % 2 == 0 { live_c } else { accent2 };
+            p.line_segment(
+                [inner, outer],
+                Stroke::new(
+                    2.6_f32,
+                    Color32::from_rgba_unmultiplied(bc.r(), bc.g(), bc.b(), bar_alpha),
+                ),
+            );
+        }
+
+        // 3. Deep Translucent Core Sphere
+        p.circle_filled(
+            center,
+            base_r - 2.0,
+            Color32::from_rgba_unmultiplied(10, 15, 30, 225),
+        );
+        p.circle_filled(
+            center,
+            base_r * (0.68 + energy * 0.14),
+            Color32::from_rgba_unmultiplied(live_c.r(), live_c.g(), live_c.b(), 36),
+        );
+
+        // 4. Three Phase-Shifted 64-Vertex Harmonic Liquid-Plasma Ribbons
+        let speed = if thinking {
+            4.8
+        } else if listening || speaking {
+            3.6
+        } else {
+            1.4
+        };
+        let layers: [(Color32, f32, f32, f32); 3] = [
+            (
+                Color32::from_rgba_unmultiplied(accent2.r(), accent2.g(), accent2.b(), 185),
+                2.4_f32,
+                1.0,
+                0.0,
+            ),
+            (
+                Color32::from_rgba_unmultiplied(live_c.r(), live_c.g(), live_c.b(), 235),
+                2.8_f32,
+                -1.35,
+                1.1,
+            ),
+            (
+                Color32::from_rgba_unmultiplied(235, 246, 255, 195),
+                1.5_f32,
+                1.75,
+                2.3,
+            ),
+        ];
+        let segs = 64usize;
+        let amp = 2.2 + energy * 11.5;
+        for (col, width, dir_mul, phase_off) in layers {
+            let mut pts = Vec::with_capacity(segs);
+            for k in 0..segs {
+                let th = (k as f32 / segs as f32) * std::f32::consts::TAU;
+                let h1 = (th * 3.0 + t * speed * dir_mul + phase_off).sin();
+                let h2 = (th * 5.0 - t * speed * 1.3 * dir_mul + phase_off * 1.7).cos() * 0.6;
+                let h3 = (th * 7.0 + t * speed * 0.8 * dir_mul).sin() * 0.32;
+                let r = base_r + amp * (h1 + h2 + h3) * 0.55;
+                pts.push(center + Vec2::new(th.cos() * r, th.sin() * r));
+            }
+            p.add(egui::Shape::closed_line(pts, Stroke::new(width, col)));
+        }
+
+        // 5. Twin Orbiting Gemini 4-Point Sparkle Satellites
+        let orbit_speed = if thinking { 3.4 } else { 1.15 };
+        for sat in 0..2 {
+            let a = t * orbit_speed + sat as f32 * std::f32::consts::PI;
+            let orbit_r = base_r + 9.0 + (a * 2.0).sin() * 4.0;
+            let pos = center + Vec2::new(a.cos() * orbit_r, a.sin() * orbit_r * 0.88);
+            let sc = if sat == 0 {
+                Color32::WHITE
+            } else {
+                accent2
+            };
+            Self::draw_gemini_sparkle(p, pos, if thinking { 6.2 } else { 4.8 }, sc);
+        }
+
+        // 6. Central Vector State Glyph (Mic / Thinking Sparkle / Speaking Waves)
+        if listening {
+            // Glowing Microphone capsule + stand
+            let mic_c = Color32::WHITE;
+            p.rect_filled(
+                Rect::from_center_size(center + Vec2::new(0.0, -4.5), Vec2::new(10.0, 16.0)),
+                CornerRadius::same(5),
+                mic_c,
+            );
+            let mut arc_pts = Vec::new();
+            for step in 0..=12 {
+                let a = (step as f32 / 12.0) * std::f32::consts::PI;
+                arc_pts.push(center + Vec2::new(a.cos() * 9.0, a.sin() * 9.0 - 3.5));
+            }
+            p.add(egui::Shape::line(arc_pts, Stroke::new(2.2_f32, mic_c)));
+            p.line_segment(
+                [center + Vec2::new(0.0, 5.5), center + Vec2::new(0.0, 11.0)],
+                Stroke::new(2.2_f32, mic_c),
+            );
+            p.line_segment(
+                [center + Vec2::new(-5.0, 11.0), center + Vec2::new(5.0, 11.0)],
+                Stroke::new(2.2_f32, mic_c),
+            );
+        } else if speaking {
+            // Animated 5-bar inner voice wave
+            for k in -2i32..=2 {
+                let x = center.x + k as f32 * 6.2;
+                let h = 6.0
+                    + (1.0 - (k.abs() as f32 * 0.28))
+                        * (8.0 + audio_level * 20.0 * ((t * 10.0 + k as f32).sin() * 0.5 + 0.5));
+                p.line_segment(
+                    [Pos2::new(x, center.y - h), Pos2::new(x, center.y + h)],
+                    Stroke::new(3.0_f32, Color32::WHITE),
+                );
+            }
+        } else {
+            let pulse = 12.5 + (t * if thinking { 5.0 } else { 2.0 }).sin() * 2.2;
+            Self::draw_gemini_sparkle(p, center, pulse, Color32::WHITE);
+            Self::draw_gemini_sparkle(
+                p,
+                center + Vec2::new(11.5, -11.5),
+                4.8,
+                live_c,
+            );
+        }
+
+        ctx.request_repaint();
+        resp
     }
 
     fn draw_dock_icon(painter: &egui::Painter, center: Pos2, idx: usize, color: Color32) {
@@ -2315,6 +2727,73 @@ impl AstryxTvApp {
                 painter.line_segment([tip, tip + Vec2::new(-3.8, -0.5)], s);
                 painter.line_segment([tip, tip + Vec2::new(0.5, -3.8)], s);
             }
+            7 => {
+                // Official Google Gemini 4-point concave Bézier star with smooth GPU vertex gradient
+                let r = 10.5_f32;
+                let ctrl = 0.85_f32;
+                let quads: [(Vec2, Vec2, Vec2); 4] = [
+                    (Vec2::new(0.0, -r), Vec2::new(ctrl, -ctrl), Vec2::new(r, 0.0)),
+                    (Vec2::new(r, 0.0), Vec2::new(ctrl, ctrl), Vec2::new(0.0, r)),
+                    (Vec2::new(0.0, r), Vec2::new(-ctrl, ctrl), Vec2::new(-r, 0.0)),
+                    (Vec2::new(-r, 0.0), Vec2::new(-ctrl, -ctrl), Vec2::new(0.0, -r)),
+                ];
+
+                // Smooth Gemini brand gradient: Cyan-Blue (#1BA1E3) -> Blue (#4E86F5) -> Violet (#9B72CB) -> Rose (#D96570)
+                let grad_color = |off: Vec2| -> Color32 {
+                    let u = ((off.x + off.y) / (2.0 * r) + 0.5).clamp(0.0, 1.0);
+                    let stops: [(f32, [f32; 3]); 4] = [
+                        (0.00, [27.0, 161.0, 227.0]),  // #1BA1E3
+                        (0.38, [78.0, 134.0, 245.0]),  // #4E86F5
+                        (0.72, [155.0, 114.0, 203.0]), // #9B72CB
+                        (1.00, [217.0, 101.0, 112.0]), // #D96570
+                    ];
+                    let mut rgb = stops[3].1;
+                    for w in stops.windows(2) {
+                        if u >= w[0].0 && u <= w[1].0 {
+                            let f = ((u - w[0].0) / (w[1].0 - w[0].0)).clamp(0.0, 1.0);
+                            rgb = [
+                                w[0].1[0] + (w[1].1[0] - w[0].1[0]) * f,
+                                w[0].1[1] + (w[1].1[1] - w[0].1[1]) * f,
+                                w[0].1[2] + (w[1].1[2] - w[0].1[2]) * f,
+                            ];
+                            break;
+                        }
+                    }
+                    Color32::from_rgb(rgb[0] as u8, rgb[1] as u8, rgb[2] as u8)
+                };
+
+                let mut ring: Vec<Vec2> = Vec::with_capacity(40);
+                let steps = 10usize;
+                for (p0, p1, p2) in quads {
+                    for s_i in 0..steps {
+                        let t = s_i as f32 / steps as f32;
+                        let inv = 1.0 - t;
+                        let pt = p0 * (inv * inv) + p1 * (2.0 * inv * t) + p2 * (t * t);
+                        ring.push(pt);
+                    }
+                }
+
+                let mut mesh = egui::Mesh::default();
+                mesh.vertices.push(egui::epaint::Vertex {
+                    pos: center,
+                    uv: egui::epaint::WHITE_UV,
+                    color: grad_color(Vec2::ZERO),
+                });
+                for &off in &ring {
+                    mesh.vertices.push(egui::epaint::Vertex {
+                        pos: center + off,
+                        uv: egui::epaint::WHITE_UV,
+                        color: grad_color(off),
+                    });
+                }
+                let n = ring.len() as u32;
+                for i in 0..n {
+                    mesh.indices.push(0);
+                    mesh.indices.push(1 + i);
+                    mesh.indices.push(1 + ((i + 1) % n));
+                }
+                painter.add(egui::Shape::mesh(mesh));
+            }
             _ => {
                 // Clean 8-tooth settings cog
                 painter.circle_stroke(center, 4.2, Stroke::new(2.0_f32, color));
@@ -2379,14 +2858,12 @@ impl AstryxTvApp {
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 6.0;
-                            let labels = [
-                                "Wi-Fi", "VPN", "Search", "Theme", "A2UI", "Refresh", "Settings",
-                            ];
-                            for (idx, tip) in labels.iter().enumerate() {
+                            let items = self.dock_items();
+                            for (pos, (action_id, tip)) in items.iter().copied().enumerate() {
                                 let focused =
-                                    self.modal == ActiveModal::None && self.focus == FocusTarget::Dock(idx);
+                                    self.modal == ActiveModal::None && self.focus == FocusTarget::Dock(pos);
                                 let anim = ctx.animate_bool_with_time(
-                                    egui::Id::new(("dock_focus", idx)),
+                                    egui::Id::new(("dock_focus", action_id)),
                                     focused,
                                     0.12,
                                 );
@@ -2419,7 +2896,7 @@ impl AstryxTvApp {
                                     );
                                 }
 
-                                let icon_color = if idx == 1 {
+                                let icon_color = if action_id == 1 {
                                     if self.status.is_vpn_active {
                                         if focused {
                                             Color32::from_rgb(74, 222, 128)
@@ -2431,15 +2908,17 @@ impl AstryxTvApp {
                                     } else {
                                         Color32::from_rgb(248, 113, 113)
                                     }
+                                } else if action_id == 7 && !focused {
+                                    accent
                                 } else if focused {
                                     Color32::WHITE
                                 } else {
                                     Color32::from_rgb(225, 232, 245)
                                 };
-                                Self::draw_dock_icon(p, rect.center(), idx, icon_color);
+                                Self::draw_dock_icon(p, rect.center(), action_id, icon_color);
 
-                                // Live status indicator dots for Wi-Fi (0) and VPN (1)
-                                if idx == 0 {
+                                // Live status indicator dots for Wi-Fi (0), VPN (1), and Settings updates (6)
+                                if action_id == 0 {
                                     let dot_c = if self.status.is_connected {
                                         Color32::from_rgb(52, 211, 153)
                                     } else {
@@ -2450,7 +2929,7 @@ impl AstryxTvApp {
                                         3.2,
                                         dot_c,
                                     );
-                                } else if idx == 1 {
+                                } else if action_id == 1 {
                                     let dot_c = if self.status.is_vpn_active {
                                         Color32::from_rgb(52, 211, 153)
                                     } else {
@@ -2461,7 +2940,7 @@ impl AstryxTvApp {
                                         3.2,
                                         dot_c,
                                     );
-                                } else if idx == 6 && self.has_update_available() {
+                                } else if action_id == 6 && self.has_update_available() {
                                     p.circle_filled(
                                         rect.right_top() + Vec2::new(-4.5, 4.5),
                                         3.8,
@@ -2470,36 +2949,10 @@ impl AstryxTvApp {
                                 }
 
                                 if resp.clicked() {
-                                    self.focus = FocusTarget::Dock(idx);
-                                    match idx {
-                                        0 => bridge::open_system_settings("network"),
-                                        1 => self.open_vpn_app(),
-                                        2 => {
-                                            self.modal = ActiveModal::Search;
-                                            self.modal_focus = 0;
-                                        }
-                                        3 => {
-                                            self.modal = ActiveModal::Theme;
-                                            self.modal_focus = 0;
-                                        }
-                                        4 => {
-                                            self.modal = ActiveModal::A2ui;
-                                            self.modal_focus = 0;
-                                        }
-                                        5 => {
-                                            self.spawn_load_apps(ctx.clone());
-                                            self.spawn_load_status(ctx.clone());
-                                            self.spawn_load_weather(ctx.clone());
-                                            self.show_toast("Refreshed apps & live London weather");
-                                        }
-                                        6 => {
-                                            self.modal = ActiveModal::Settings;
-                                            self.modal_focus = 0;
-                                        }
-                                        _ => {}
-                                    }
+                                    self.focus = FocusTarget::Dock(pos);
+                                    self.trigger_dock_action(action_id, ctx);
                                 }
-                                resp.on_hover_text(*tip);
+                                resp.on_hover_text(tip);
                             }
                         });
                     });
@@ -2819,6 +3272,885 @@ impl AstryxTvApp {
         }
     }
 
+    fn draw_toggle_pill(
+        ctx: &egui::Context,
+        p: &egui::Painter,
+        rect: Rect,
+        is_on: bool,
+        focused: bool,
+        accent: Color32,
+        salt: usize,
+    ) {
+        let anim_t = ctx.animate_bool_with_time(
+            egui::Id::new(("settings_toggle_pill", salt)),
+            is_on,
+            0.12,
+        );
+        let r = rect.height() * 0.5;
+        let track_fill = if is_on {
+            Color32::from_rgba_unmultiplied(
+                accent.r(),
+                accent.g(),
+                accent.b(),
+                if focused { 235 } else { 185 },
+            )
+        } else {
+            Color32::from_rgba_unmultiplied(255, 255, 255, if focused { 52 } else { 32 })
+        };
+        p.rect_filled(rect, CornerRadius::same(r as u8), track_fill);
+        p.rect_stroke(
+            rect,
+            CornerRadius::same(r as u8),
+            if focused {
+                Stroke::new(1.3_f32, Color32::WHITE)
+            } else if is_on {
+                Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(255, 255, 255, 75))
+            } else {
+                Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(255, 255, 255, 42))
+            },
+            egui::StrokeKind::Inside,
+        );
+        let pad = 3.0_f32;
+        let thumb_r = r - pad;
+        let x0 = rect.left() + r;
+        let x1 = rect.right() - r;
+        let cx = x0 + (x1 - x0) * anim_t;
+        let cy = rect.center().y;
+        p.circle_filled(
+            Pos2::new(cx, cy + 0.8),
+            thumb_r,
+            Color32::from_rgba_unmultiplied(0, 0, 0, 75),
+        );
+        p.circle_filled(Pos2::new(cx, cy), thumb_r, Color32::WHITE);
+    }
+
+    fn draw_settings_live_preview(
+        &self,
+        ctx: &egui::Context,
+        p: &egui::Painter,
+        rect: Rect,
+        tab: usize,
+        row_idx: usize,
+        visible_count: usize,
+    ) {
+        let accent = self.config.accent();
+        let accent2 = self.config.accent2();
+        let [tr, tg, tb] = self.config.astryx_theme.surface_tint();
+        let time_str = if self.cached_time_str.is_empty() {
+            "21:42"
+        } else {
+            self.cached_time_str.as_str()
+        };
+        let date_short = if self.cached_date_short.is_empty() {
+            "Thu 27 Nov"
+        } else {
+            self.cached_date_short.as_str()
+        };
+        let city_short = self
+            .config
+            .weather_city
+            .split('·')
+            .next()
+            .unwrap_or("London")
+            .trim();
+        let temp_str = self
+            .weather
+            .as_ref()
+            .map(|w| format!("{} · {}", self.fmt_temp(w.temp_c), w.condition))
+            .unwrap_or_else(|| "14°C · Clear".to_string());
+
+        // Base canvas fill + soft subtle corner frame
+        p.rect_filled(
+            rect,
+            CornerRadius::same(13),
+            Color32::from_rgba_unmultiplied(
+                tr.saturating_sub(4),
+                tg.saturating_sub(4),
+                tb.saturating_sub(2),
+                240,
+            ),
+        );
+
+        // Smooth GPU-interpolated radial gradient glow (triangle fan: zero concentric ring banding at 4K)
+        let soft_glow = |center: Pos2, max_r: f32, col: Color32, peak_alpha: u8| {
+            let mut mesh = egui::Mesh::default();
+            let center_c = Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), peak_alpha);
+            let edge_c = Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), 0);
+            mesh.colored_vertex(center, center_c);
+            let segs = 24usize;
+            for i in 0..segs {
+                let a = (i as f32 / segs as f32) * std::f32::consts::TAU;
+                mesh.colored_vertex(
+                    center + Vec2::new(a.cos() * max_r, a.sin() * max_r),
+                    edge_c,
+                );
+            }
+            for i in 0..segs {
+                let next = (i + 1) % segs;
+                mesh.add_triangle(0, (1 + i) as u32, (1 + next) as u32);
+            }
+            p.add(egui::Shape::mesh(mesh));
+        };
+
+        // ---------------------------------------------------------------------
+        // MODE A: Live Screensaver Style Preview (Appearance rows 2 & 3)
+        // ---------------------------------------------------------------------
+        if tab == 0 && (row_idx == 2 || row_idx == 3) {
+            // Silky GPU radial ambient glow
+            soft_glow(
+                Pos2::new(rect.left() + rect.width() * 0.22, rect.top() + 34.0),
+                86.0,
+                accent,
+                56,
+            );
+            soft_glow(
+                Pos2::new(rect.right() - rect.width() * 0.22, rect.bottom() - 28.0),
+                82.0,
+                accent2,
+                50,
+            );
+
+            let c = Pos2::new(rect.center().x, rect.center().y - 8.0);
+            match self.config.screensaver_style {
+                ScreensaverStyle::Classic => {
+                    p.text(
+                        c + Vec2::new(0.0, -14.0),
+                        Align2::CENTER_CENTER,
+                        time_str,
+                        FontId::proportional(38.0),
+                        Color32::WHITE,
+                    );
+                    p.text(
+                        c + Vec2::new(0.0, 14.0),
+                        Align2::CENTER_CENTER,
+                        date_short,
+                        FontId::proportional(11.5),
+                        Color32::from_rgb(206, 220, 242),
+                    );
+                    p.text(
+                        c + Vec2::new(0.0, 30.0),
+                        Align2::CENTER_CENTER,
+                        &temp_str,
+                        FontId::proportional(11.0),
+                        accent,
+                    );
+                }
+                ScreensaverStyle::GlassCard => {
+                    let card = Rect::from_center_size(c, Vec2::new(205.0, 96.0));
+                    p.rect_filled(
+                        card,
+                        CornerRadius::same(16),
+                        Color32::from_rgba_unmultiplied(12, 18, 34, 195),
+                    );
+                    p.rect_stroke(
+                        card,
+                        CornerRadius::same(16),
+                        Stroke::new(
+                            1.3_f32,
+                            Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 155),
+                        ),
+                        egui::StrokeKind::Inside,
+                    );
+                    p.text(
+                        c + Vec2::new(0.0, -18.0),
+                        Align2::CENTER_CENTER,
+                        time_str,
+                        FontId::proportional(32.0),
+                        Color32::WHITE,
+                    );
+                    p.rect_filled(
+                        Rect::from_center_size(c + Vec2::new(0.0, 4.0), Vec2::new(56.0, 2.0)),
+                        CornerRadius::same(1),
+                        accent,
+                    );
+                    p.text(
+                        c + Vec2::new(0.0, 18.0),
+                        Align2::CENTER_CENTER,
+                        date_short,
+                        FontId::proportional(10.5),
+                        Color32::from_rgb(206, 220, 242),
+                    );
+                    p.text(
+                        c + Vec2::new(0.0, 32.0),
+                        Align2::CENTER_CENTER,
+                        format!("{city_short} · {temp_str}"),
+                        FontId::proportional(10.0),
+                        accent,
+                    );
+                }
+                ScreensaverStyle::MinimalClock => {
+                    p.text(
+                        c,
+                        Align2::CENTER_CENTER,
+                        time_str,
+                        FontId::proportional(48.0),
+                        Color32::from_rgba_unmultiplied(255, 255, 255, 242),
+                    );
+                    p.rect_filled(
+                        Rect::from_center_size(c + Vec2::new(0.0, 30.0), Vec2::new(42.0, 1.5)),
+                        CornerRadius::same(1),
+                        Color32::from_rgba_unmultiplied(255, 255, 255, 80),
+                    );
+                }
+                ScreensaverStyle::EditorialSplit => {
+                    let card = Rect::from_center_size(c, Vec2::new(248.0, 74.0));
+                    p.rect_filled(
+                        card,
+                        CornerRadius::same(14),
+                        Color32::from_rgba_unmultiplied(8, 12, 22, 165),
+                    );
+                    p.rect_stroke(
+                        card,
+                        CornerRadius::same(14),
+                        Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(255, 255, 255, 28)),
+                        egui::StrokeKind::Inside,
+                    );
+                    p.text(
+                        Pos2::new(c.x - 16.0, c.y),
+                        Align2::RIGHT_CENTER,
+                        time_str,
+                        FontId::proportional(33.0),
+                        Color32::WHITE,
+                    );
+                    p.rect_filled(
+                        Rect::from_center_size(Pos2::new(c.x - 4.0, c.y), Vec2::new(2.5, 42.0)),
+                        CornerRadius::same(2),
+                        accent,
+                    );
+                    p.text(
+                        Pos2::new(c.x + 8.0, c.y - 13.0),
+                        Align2::LEFT_CENTER,
+                        date_short.to_uppercase(),
+                        FontId::proportional(10.5),
+                        Color32::from_rgb(228, 236, 250),
+                    );
+                    p.text(
+                        Pos2::new(c.x + 8.0, c.y + 1.0),
+                        Align2::LEFT_CENTER,
+                        city_short,
+                        FontId::proportional(10.0),
+                        Color32::from_rgb(164, 180, 206),
+                    );
+                    p.text(
+                        Pos2::new(c.x + 8.0, c.y + 15.0),
+                        Align2::LEFT_CENTER,
+                        &temp_str,
+                        FontId::proportional(10.0),
+                        accent,
+                    );
+                }
+                ScreensaverStyle::NeonRing => {
+                    let r = 52.0_f32;
+                    p.circle_filled(c, r - 3.0, Color32::from_rgba_unmultiplied(8, 12, 24, 190));
+                    p.circle_stroke(
+                        c,
+                        r + 4.0,
+                        Stroke::new(
+                            1.1_f32,
+                            Color32::from_rgba_unmultiplied(accent2.r(), accent2.g(), accent2.b(), 105),
+                        ),
+                    );
+                    p.circle_stroke(
+                        c,
+                        r,
+                        Stroke::new(
+                            2.2_f32,
+                            Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 220),
+                        ),
+                    );
+                    p.text(
+                        c + Vec2::new(0.0, -10.0),
+                        Align2::CENTER_CENTER,
+                        time_str,
+                        FontId::proportional(24.0),
+                        Color32::WHITE,
+                    );
+                    p.text(
+                        c + Vec2::new(0.0, 10.0),
+                        Align2::CENTER_CENTER,
+                        date_short,
+                        FontId::proportional(9.5),
+                        Color32::from_rgb(206, 220, 242),
+                    );
+                    p.text(
+                        c + Vec2::new(0.0, 24.0),
+                        Align2::CENTER_CENTER,
+                        &temp_str,
+                        FontId::proportional(9.5),
+                        accent,
+                    );
+                }
+            }
+
+            // Bottom 5-style indicator dots + idle timer badge
+            let active_idx = match self.config.screensaver_style {
+                ScreensaverStyle::Classic => 0,
+                ScreensaverStyle::GlassCard => 1,
+                ScreensaverStyle::MinimalClock => 2,
+                ScreensaverStyle::EditorialSplit => 3,
+                ScreensaverStyle::NeonRing => 4,
+            };
+            for i in 0..5usize {
+                let x = rect.center().x + (i as f32 - 2.0) * 14.0;
+                let y = rect.bottom() - 12.0;
+                p.circle_filled(
+                    Pos2::new(x, y),
+                    if i == active_idx { 3.5 } else { 2.2 },
+                    if i == active_idx {
+                        accent
+                    } else {
+                        Color32::from_rgba_unmultiplied(255, 255, 255, 65)
+                    },
+                );
+            }
+            let idle_txt = match self.config.ambient_timeout_secs {
+                0 => "Timer: OFF",
+                60 => "Idle: 1 min",
+                180 => "Idle: 3 min",
+                _ => "Idle: 5 min",
+            };
+            p.text(
+                Pos2::new(rect.right() - 10.0, rect.bottom() - 12.0),
+                Align2::RIGHT_CENTER,
+                idle_txt,
+                FontId::proportional(9.5),
+                Color32::from_rgb(168, 184, 210),
+            );
+        }
+        // ---------------------------------------------------------------------
+        // MODE B: Live Animated Gemini Plasma Orb Preview (Gemini AI Tab)
+        // ---------------------------------------------------------------------
+        else if tab == 2 {
+            let t = self.start_time.elapsed().as_secs_f32();
+            if !self.config.lightweight_mode {
+                ctx.request_repaint_after(Duration::from_millis(45));
+            }
+            let orb_c = Pos2::new(rect.center().x, rect.center().y - 12.0);
+            let active = self.config.gemini_enabled;
+            let base_r = 28.0_f32;
+
+            // Soft feathered backdrop nebula
+            soft_glow(
+                orb_c,
+                74.0,
+                if active {
+                    Color32::from_rgb(139, 92, 246)
+                } else {
+                    Color32::from_rgb(100, 116, 139)
+                },
+                if active { 48 } else { 18 },
+            );
+
+            // Expanding sonar rings
+            for ri in 0..2 {
+                let phase = ((t * 0.45 + ri as f32 * 0.5) % 1.0).clamp(0.0, 1.0);
+                let r = base_r + 8.0 + phase * 26.0;
+                let a = ((1.0 - phase) * if active { 95.0 } else { 32.0 }) as u8;
+                let rc = if ri == 0 { accent } else { accent2 };
+                p.circle_stroke(
+                    orb_c,
+                    r,
+                    Stroke::new(1.3_f32, Color32::from_rgba_unmultiplied(rc.r(), rc.g(), rc.b(), a)),
+                );
+            }
+
+            // 20-bar gentle ambient soundwave equalizer
+            for b in 0..20usize {
+                let ang = (b as f32 / 20.0) * std::f32::consts::TAU - std::f32::consts::FRAC_PI_2;
+                let dir = Vec2::new(ang.cos(), ang.sin());
+                let wave = ((ang * 3.0 + t * 2.6).sin() * 0.5 + 0.5)
+                    * ((ang * 2.0 - t * 1.9).cos() * 0.5 + 0.5);
+                let len = if active { 3.5 + wave * 7.5 } else { 2.0 };
+                let bc = if b % 2 == 0 { accent } else { accent2 };
+                p.line_segment(
+                    [orb_c + dir * (base_r + 5.0), orb_c + dir * (base_r + 5.0 + len)],
+                    Stroke::new(
+                        2.0_f32,
+                        Color32::from_rgba_unmultiplied(bc.r(), bc.g(), bc.b(), if active { 155 } else { 45 }),
+                    ),
+                );
+            }
+
+            // Translucent sphere + color plasma lobes + GPU-gradient Gemini star
+            p.circle_filled(orb_c, base_r, Color32::from_rgba_unmultiplied(12, 16, 34, 220));
+            if active {
+                let drift = Vec2::new((t * 1.4).cos() * 7.0, (t * 1.1).sin() * 6.0);
+                p.circle_filled(
+                    orb_c + drift,
+                    18.0,
+                    Color32::from_rgba_unmultiplied(56, 189, 248, 72),
+                );
+                p.circle_filled(
+                    orb_c - drift,
+                    18.0,
+                    Color32::from_rgba_unmultiplied(168, 85, 247, 72),
+                );
+            }
+            p.circle_stroke(
+                orb_c,
+                base_r,
+                Stroke::new(
+                    1.6_f32,
+                    if active {
+                        Color32::from_rgba_unmultiplied(192, 132, 252, 210)
+                    } else {
+                        Color32::from_rgba_unmultiplied(255, 255, 255, 55)
+                    },
+                ),
+            );
+            Self::draw_dock_icon(p, orb_c, 7, Color32::WHITE);
+
+            // Bottom model + API key pills
+            let has_key = !self.config.gemini_api_key.trim().is_empty();
+            let model_pill = Rect::from_min_size(
+                Pos2::new(rect.left() + 10.0, rect.bottom() - 26.0),
+                Vec2::new(150.0, 18.0),
+            );
+            p.rect_filled(
+                model_pill,
+                CornerRadius::same(6),
+                Color32::from_rgba_unmultiplied(255, 255, 255, 18),
+            );
+            p.text(
+                model_pill.center(),
+                Align2::CENTER_CENTER,
+                &self.config.gemini_model,
+                FontId::proportional(9.5),
+                Color32::from_rgb(224, 232, 248),
+            );
+
+            let key_pill = Rect::from_min_size(
+                Pos2::new(rect.right() - 122.0, rect.bottom() - 26.0),
+                Vec2::new(112.0, 18.0),
+            );
+            let key_c = if has_key {
+                Color32::from_rgb(52, 211, 153)
+            } else {
+                Color32::from_rgb(251, 191, 36)
+            };
+            p.rect_filled(
+                key_pill,
+                CornerRadius::same(6),
+                Color32::from_rgba_unmultiplied(key_c.r(), key_c.g(), key_c.b(), 34),
+            );
+            p.text(
+                key_pill.center(),
+                Align2::CENTER_CENTER,
+                if has_key { "API Key Ready" } else { "Set Key :8787" },
+                FontId::proportional(9.5),
+                key_c,
+            );
+        }
+        // ---------------------------------------------------------------------
+        // MODE C: Live Miniature TV Home Screen Preview (Appearance + Weather/HUD)
+        // ---------------------------------------------------------------------
+        else if tab == 0 || tab == 1 {
+            // Soft theme glow blobs (hidden in Lightweight Mode so toggle visibly responds!)
+            if !self.config.lightweight_mode {
+                soft_glow(
+                    Pos2::new(rect.left() + 56.0, rect.top() + 34.0),
+                    78.0,
+                    accent,
+                    42,
+                );
+                soft_glow(
+                    Pos2::new(rect.right() - 52.0, rect.bottom() - 34.0),
+                    72.0,
+                    accent2,
+                    36,
+                );
+            }
+
+            // Top-left Clock & Weather Header
+            if self.config.show_header {
+                p.text(
+                    Pos2::new(rect.left() + 14.0, rect.top() + 20.0),
+                    Align2::LEFT_CENTER,
+                    time_str,
+                    FontId::proportional(21.0),
+                    Color32::WHITE,
+                );
+                let sub_line = if self.config.show_weather {
+                    format!("{date_short} · {city_short} {temp_str}")
+                } else {
+                    date_short.to_string()
+                };
+                p.text(
+                    Pos2::new(rect.left() + 14.0, rect.top() + 37.0),
+                    Align2::LEFT_CENTER,
+                    sub_line,
+                    FontId::proportional(8.8),
+                    Color32::from_rgb(200, 214, 236),
+                );
+            } else {
+                p.text(
+                    Pos2::new(rect.left() + 14.0, rect.top() + 18.0),
+                    Align2::LEFT_CENTER,
+                    "Header Hidden",
+                    FontId::proportional(9.0),
+                    Color32::from_rgba_unmultiplied(255, 255, 255, 72),
+                );
+            }
+
+            // Live Status Pill
+            if self.config.show_status_pill {
+                let sp = Rect::from_min_size(
+                    Pos2::new(rect.left() + 14.0, rect.top() + 47.0),
+                    Vec2::new(112.0, 14.0),
+                );
+                p.rect_filled(sp, CornerRadius::same(7), Color32::from_rgba_unmultiplied(0, 0, 0, 96));
+                p.rect_stroke(
+                    sp,
+                    CornerRadius::same(7),
+                    Stroke::new(0.8_f32, Color32::from_rgba_unmultiplied(255, 255, 255, 36)),
+                    egui::StrokeKind::Inside,
+                );
+                p.circle_filled(
+                    Pos2::new(sp.left() + 7.0, sp.center().y),
+                    2.6,
+                    if self.status.is_connected {
+                        Color32::from_rgb(52, 211, 153)
+                    } else {
+                        Color32::from_rgb(248, 113, 113)
+                    },
+                );
+                p.text(
+                    Pos2::new(sp.left() + 14.0, sp.center().y),
+                    Align2::LEFT_CENTER,
+                    format!(
+                        "Wi-Fi · VPN {}",
+                        if self.status.is_vpn_active { "ON" } else { "OFF" }
+                    ),
+                    FontId::proportional(8.0),
+                    Color32::from_rgb(218, 228, 246),
+                );
+            }
+
+            // Optional Performance HUD badge
+            if self.config.show_fps_meter {
+                let hud = Rect::from_center_size(
+                    Pos2::new(rect.center().x + 8.0, rect.top() + 16.0),
+                    Vec2::new(54.0, 14.0),
+                );
+                p.rect_filled(hud, CornerRadius::same(5), Color32::from_rgba_unmultiplied(6, 12, 20, 185));
+                p.rect_stroke(
+                    hud,
+                    CornerRadius::same(5),
+                    Stroke::new(0.8_f32, Color32::from_rgb(52, 211, 153)),
+                    egui::StrokeKind::Inside,
+                );
+                p.text(
+                    hud.center(),
+                    Align2::CENTER_CENTER,
+                    format!("{:.0} FPS", self.display_hz.max(60.0)),
+                    FontId::proportional(8.0),
+                    Color32::from_rgb(52, 211, 153),
+                );
+            }
+
+            // Top-right mini dock pill (with live Gemini color star!)
+            let dock_w = if self.config.gemini_enabled { 72.0 } else { 56.0 };
+            let dock_r = Rect::from_min_size(
+                Pos2::new(rect.right() - dock_w - 12.0, rect.top() + 12.0),
+                Vec2::new(dock_w, 18.0),
+            );
+            p.rect_filled(
+                dock_r,
+                CornerRadius::same(9),
+                Color32::from_rgba_unmultiplied(0, 0, 0, 108),
+            );
+            p.rect_stroke(
+                dock_r,
+                CornerRadius::same(9),
+                Stroke::new(0.8_f32, Color32::from_rgba_unmultiplied(255, 255, 255, 34)),
+                egui::StrokeKind::Inside,
+            );
+            let mut dx = dock_r.left() + 11.0;
+            p.circle_filled(Pos2::new(dx, dock_r.center().y), 3.0, Color32::from_rgb(52, 211, 153));
+            dx += 13.0;
+            p.circle_filled(Pos2::new(dx, dock_r.center().y), 3.0, Color32::from_rgb(186, 202, 228));
+            if self.config.gemini_enabled {
+                dx += 14.0;
+                // Mini 4-point Gemini star in preview bar
+                let sc = Pos2::new(dx, dock_r.center().y);
+                let mut pts = Vec::with_capacity(8);
+                for k in 0..8 {
+                    let rad = if k % 2 == 0 { 5.2 } else { 1.8 };
+                    let a = -std::f32::consts::FRAC_PI_2 + k as f32 * std::f32::consts::FRAC_PI_4;
+                    pts.push(sc + Vec2::new(a.cos() * rad, a.sin() * rad));
+                }
+                p.add(egui::Shape::convex_polygon(
+                    pts,
+                    Color32::from_rgb(142, 132, 245),
+                    Stroke::NONE,
+                ));
+            }
+            p.circle_filled(Pos2::new(dock_r.right() - 11.0, dock_r.center().y), 4.0, accent);
+
+            let tile_colors = [
+                Color32::from_rgb(225, 29, 72),
+                Color32::from_rgb(124, 58, 237),
+                Color32::from_rgb(234, 88, 12),
+                Color32::from_rgb(16, 185, 129),
+                Color32::from_rgb(14, 165, 233),
+                Color32::from_rgb(217, 70, 239),
+                Color32::from_rgb(245, 158, 11),
+                Color32::from_rgb(59, 130, 246),
+            ];
+
+            // Home layout preview: Zenith Horizon Dock vs Classic Grid
+            match self.config.layout_style {
+                LayoutStyle::Zenith => {
+                    if self.config.show_now_playing {
+                        let np = Rect::from_min_size(
+                            Pos2::new(rect.left() + 14.0, rect.bottom() - 68.0),
+                            Vec2::new(138.0, 15.0),
+                        );
+                        p.rect_filled(np, CornerRadius::same(6), Color32::from_rgba_unmultiplied(0, 0, 0, 112));
+                        p.circle_filled(
+                            Pos2::new(np.left() + 8.0, np.center().y),
+                            2.8,
+                            Color32::from_rgb(52, 211, 153),
+                        );
+                        p.text(
+                            Pos2::new(np.left() + 16.0, np.center().y),
+                            Align2::LEFT_CENTER,
+                            "Now Playing · Media",
+                            FontId::proportional(8.0),
+                            Color32::from_rgb(220, 230, 246),
+                        );
+                    }
+                    let (tw, th, gap) = match self.config.icon_size {
+                        IconSize::Compact => (36.0_f32, 22.0_f32, 8.0_f32),
+                        IconSize::Standard => (44.0_f32, 27.0_f32, 9.0_f32),
+                        IconSize::Large => (52.0_f32, 32.0_f32, 9.0_f32),
+                    };
+                    let count = 5usize;
+                    let total_w = count as f32 * tw + (count - 1) as f32 * gap;
+                    let start_x = rect.center().x - total_w * 0.5;
+                    let base_y = rect.bottom() - if self.config.show_labels { 22.0 } else { 14.0 } - th;
+                    for i in 0..count {
+                        let tr_rect = Rect::from_min_size(
+                            Pos2::new(start_x + i as f32 * (tw + gap), base_y),
+                            Vec2::new(tw, th),
+                        );
+                        p.rect_filled(tr_rect, CornerRadius::same(7), tile_colors[i]);
+                        if i == 0 {
+                            p.rect_stroke(
+                                tr_rect.expand(1.5),
+                                CornerRadius::same(8),
+                                Stroke::new(1.8_f32, accent),
+                                egui::StrokeKind::Outside,
+                            );
+                        }
+                        if self.config.show_labels {
+                            p.rect_filled(
+                                Rect::from_center_size(
+                                    Pos2::new(tr_rect.center().x, tr_rect.bottom() + 6.0),
+                                    Vec2::new(tw * 0.65, 3.0),
+                                ),
+                                CornerRadius::same(1),
+                                Color32::from_rgba_unmultiplied(255, 255, 255, 165),
+                            );
+                        }
+                    }
+                }
+                LayoutStyle::Classic => {
+                    let (tw, th, gx, gy) = match self.config.icon_size {
+                        IconSize::Compact => (46.0_f32, 22.0_f32, 9.0_f32, 13.0_f32),
+                        IconSize::Standard => (56.0_f32, 26.0_f32, 10.0_f32, 14.0_f32),
+                        IconSize::Large => (64.0_f32, 30.0_f32, 10.0_f32, 14.0_f32),
+                    };
+                    let cols = 4usize;
+                    let total_w = cols as f32 * tw + (cols - 1) as f32 * gx;
+                    let start_x = rect.center().x - total_w * 0.5;
+                    let start_y = rect.top() + 72.0;
+                    for r_i in 0..2usize {
+                        for c_i in 0..cols {
+                            let idx = r_i * cols + c_i;
+                            let tr_rect = Rect::from_min_size(
+                                Pos2::new(start_x + c_i as f32 * (tw + gx), start_y + r_i as f32 * (th + gy)),
+                                Vec2::new(tw, th),
+                            );
+                            p.rect_filled(tr_rect, CornerRadius::same(6), tile_colors[idx % tile_colors.len()]);
+                            if idx == 0 {
+                                p.rect_stroke(
+                                    tr_rect.expand(1.2),
+                                    CornerRadius::same(7),
+                                    Stroke::new(1.8_f32, accent),
+                                    egui::StrokeKind::Outside,
+                                );
+                            }
+                            if self.config.show_labels {
+                                p.rect_filled(
+                                    Rect::from_center_size(
+                                        Pos2::new(tr_rect.center().x, tr_rect.bottom() + 4.5),
+                                        Vec2::new(tw * 0.58, 2.6),
+                                    ),
+                                    CornerRadius::same(1),
+                                    Color32::from_rgba_unmultiplied(255, 255, 255, 155),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Night dimming veil preview when Auto Night Dimming is focused & ON
+            if self.config.auto_night_dim && tab == 0 && row_idx == 7 {
+                p.rect_filled(rect, CornerRadius::same(13), Color32::from_rgba_unmultiplied(4, 6, 14, 72));
+                p.text(
+                    Pos2::new(rect.right() - 10.0, rect.bottom() - 10.0),
+                    Align2::RIGHT_CENTER,
+                    "Night Dimming Active",
+                    FontId::proportional(9.0),
+                    Color32::from_rgb(192, 132, 252),
+                );
+            } else {
+                p.text(
+                    Pos2::new(rect.right() - 10.0, rect.bottom() - 8.0),
+                    Align2::RIGHT_CENTER,
+                    format!(
+                        "{} · {}",
+                        self.config.astryx_theme.label().replace("Astryx ", ""),
+                        self.config.weather_scene.label()
+                    ),
+                    FontId::proportional(8.5),
+                    Color32::from_rgba_unmultiplied(210, 224, 246, 175),
+                );
+            }
+        }
+        // ---------------------------------------------------------------------
+        // MODE D: Live TV Telemetry & Health Card (Apps & System Tabs)
+        // ---------------------------------------------------------------------
+        else {
+            let pad = 14.0_f32;
+            // Device header
+            p.text(
+                Pos2::new(rect.left() + pad, rect.top() + 20.0),
+                Align2::LEFT_CENTER,
+                format!(
+                    "{} · Android {} · {:.0}Hz",
+                    self.status.device_model, self.status.android_version, self.display_hz
+                ),
+                FontId::proportional(11.5),
+                Color32::WHITE,
+            );
+            let vpn_c = if self.status.is_vpn_active {
+                Color32::from_rgb(52, 211, 153)
+            } else {
+                Color32::from_rgb(148, 163, 184)
+            };
+            let vpn_pill = Rect::from_min_size(
+                Pos2::new(rect.right() - pad - 56.0, rect.top() + 11.0),
+                Vec2::new(56.0, 17.0),
+            );
+            p.rect_filled(
+                vpn_pill,
+                CornerRadius::same(6),
+                Color32::from_rgba_unmultiplied(vpn_c.r(), vpn_c.g(), vpn_c.b(), 34),
+            );
+            p.text(
+                vpn_pill.center(),
+                Align2::CENTER_CENTER,
+                if self.status.is_vpn_active { "VPN ON" } else { "VPN OFF" },
+                FontId::proportional(8.8),
+                vpn_c,
+            );
+
+            // RAM progress bar
+            let ram_y = rect.top() + 48.0;
+            let ram_used = (self.status.ram_total_mb - self.status.ram_free_mb).max(0) as f32
+                / (self.status.ram_total_mb.max(1) as f32);
+            p.text(
+                Pos2::new(rect.left() + pad, ram_y),
+                Align2::LEFT_CENTER,
+                "MEMORY (RAM)",
+                FontId::proportional(9.5),
+                Color32::from_rgb(156, 174, 202),
+            );
+            p.text(
+                Pos2::new(rect.right() - pad, ram_y),
+                Align2::RIGHT_CENTER,
+                format!("{} / {} MB free", self.status.ram_free_mb, self.status.ram_total_mb),
+                FontId::proportional(10.5),
+                Color32::WHITE,
+            );
+            let bar_w = rect.width() - pad * 2.0;
+            let ram_bar = Rect::from_min_size(Pos2::new(rect.left() + pad, ram_y + 10.0), Vec2::new(bar_w, 6.0));
+            p.rect_filled(ram_bar, CornerRadius::same(3), Color32::from_rgba_unmultiplied(255, 255, 255, 24));
+            let mut ram_fill = ram_bar;
+            ram_fill.set_width((bar_w * ram_used.clamp(0.06, 1.0)).max(6.0));
+            p.rect_filled(ram_fill, CornerRadius::same(3), accent);
+
+            // Storage progress bar
+            let sto_y = rect.top() + 86.0;
+            let sto_used = ((self.status.storage_total_gb - self.status.storage_free_gb).max(0.0)
+                / self.status.storage_total_gb.max(0.1)) as f32;
+            p.text(
+                Pos2::new(rect.left() + pad, sto_y),
+                Align2::LEFT_CENTER,
+                "STORAGE",
+                FontId::proportional(9.5),
+                Color32::from_rgb(156, 174, 202),
+            );
+            p.text(
+                Pos2::new(rect.right() - pad, sto_y),
+                Align2::RIGHT_CENTER,
+                format!(
+                    "{:.1} / {:.1} GB free",
+                    self.status.storage_free_gb, self.status.storage_total_gb
+                ),
+                FontId::proportional(10.5),
+                Color32::WHITE,
+            );
+            let sto_bar = Rect::from_min_size(Pos2::new(rect.left() + pad, sto_y + 10.0), Vec2::new(bar_w, 6.0));
+            p.rect_filled(sto_bar, CornerRadius::same(3), Color32::from_rgba_unmultiplied(255, 255, 255, 24));
+            let mut sto_fill = sto_bar;
+            sto_fill.set_width((bar_w * sto_used.clamp(0.06, 1.0)).max(6.0));
+            p.rect_filled(sto_fill, CornerRadius::same(3), Color32::from_rgb(52, 211, 153));
+
+            // Bottom 3 stat pills
+            let pill_y = rect.bottom() - 40.0;
+            let pill_gap = 8.0_f32;
+            let pill_w = (bar_w - pill_gap * 2.0) / 3.0;
+            let stats = [
+                ("APPS", format!("{} visible", visible_count)),
+                ("COMPANION", format!(":{WEB_COMPANION_PORT}")),
+                ("VERSION", format!("v{}", self.app_version)),
+            ];
+            for (i, (k, v)) in stats.iter().enumerate() {
+                let pr = Rect::from_min_size(
+                    Pos2::new(rect.left() + pad + i as f32 * (pill_w + pill_gap), pill_y),
+                    Vec2::new(pill_w, 30.0),
+                );
+                p.rect_filled(pr, CornerRadius::same(8), Color32::from_rgba_unmultiplied(255, 255, 255, 13));
+                p.text(
+                    Pos2::new(pr.center().x, pr.top() + 9.0),
+                    Align2::CENTER_CENTER,
+                    *k,
+                    FontId::proportional(8.0),
+                    Color32::from_rgb(152, 170, 198),
+                );
+                p.text(
+                    Pos2::new(pr.center().x, pr.bottom() - 9.0),
+                    Align2::CENTER_CENTER,
+                    v,
+                    FontId::proportional(10.5),
+                    Color32::WHITE,
+                );
+            }
+        }
+
+        // Outer crisp glass rim
+        p.rect_stroke(
+            rect,
+            CornerRadius::same(13),
+            Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(255, 255, 255, 30)),
+            egui::StrokeKind::Inside,
+        );
+    }
+
     fn draw_modal_shell(
         &mut self,
         ctx: &egui::Context,
@@ -3128,7 +4460,7 @@ impl AstryxTvApp {
                                         .color(accent),
                                 );
                                 ui.label(
-                                    RichText::new("Your launcher is pre-configured with Zenith Horizon, 3×3 Grid Settings, and Live 1km UK Satellite. Customize below or press OK to start.")
+                                    RichText::new("Your launcher is pre-configured with Zenith Horizon, Cinema Ribbon Settings, and Live 1km UK Satellite. Customize below or press OK to start.")
                                         .font(FontId::proportional(12.5))
                                         .color(Color32::from_rgb(215, 226, 244)),
                                 );
@@ -4012,15 +5344,370 @@ impl AstryxTvApp {
             }
 
             ActiveModal::Settings => {
-                // 29 settings (0..29, 4 clean categories with Theme & Glass merged in!) + row 29 = Android TV Shortcuts
-                const SETTING_COUNT: usize = 29;
-                const SYS_IDX: usize = 29;
-                const GRID_COLS: usize = 3;
-                let is_grid = self.config.settings_view == SettingsViewMode::Grid;
+                // =====================================================================
+                // Option 04: Cinema Ribbon & Live Preview Settings Studio
+                //   Top floating 5-tab Cinema Ribbon + 60/40 Split Glass Stage
+                // =====================================================================
+                let jni_back = bridge::take_back_pressed();
+                let key_back =
+                    ctx.input(|i| i.key_pressed(Key::Escape) || i.key_pressed(Key::Backspace));
+                if (jni_back || key_back)
+                    && self.last_back_handled.elapsed() > Duration::from_millis(260)
+                {
+                    self.last_back_handled = Instant::now();
+                    self.close_modal_step();
+                    return;
+                }
 
-                let mut trigger = false;
-                let mut left_key = false;
-                let mut right_key = false;
+                // 5 Ribbon Categories: (label, icon_id)
+                const TABS: [(&str, usize); 5] = [
+                    ("Appearance", 201),
+                    ("Weather & HUD", 4),
+                    ("Gemini AI", 203),
+                    ("Apps", 2),
+                    ("System", 204),
+                ];
+
+                // Kind: 0 = bool toggle pill, 1 = cycle value badge, 2 = submenu / action chevron
+                struct SettingRow {
+                    label: &'static str,
+                    desc: &'static str,
+                    val: String,
+                    is_on: bool,
+                    icon_id: usize,
+                    kind: u8,
+                }
+
+                self.settings_tab = self.settings_tab.min(TABS.len() - 1);
+                let tab = self.settings_tab;
+                let has_key = !self.config.gemini_api_key.trim().is_empty();
+
+                let rows: Vec<SettingRow> = match tab {
+                    // Tab 0: Appearance (9 items)
+                    0 => vec![
+                        SettingRow {
+                            label: "Theme & Glass",
+                            desc: "Customize surface tint, 4K live weather or shader wallpaper, accent hue, and frosted glass blur.",
+                            val: self.config.astryx_theme.label().replace("Astryx ", ""),
+                            is_on: true,
+                            icon_id: 201,
+                            kind: 2,
+                        },
+                        SettingRow {
+                            label: "Home Layout",
+                            desc: "Switch between Zenith Horizon floating bottom dock and Classic full-screen App Grid.",
+                            val: self.config.layout_style.label().to_string(),
+                            is_on: true,
+                            icon_id: 0,
+                            kind: 1,
+                        },
+                        SettingRow {
+                            label: "Screensaver Style",
+                            desc: "Pick the centered ambient clock aesthetic shown when your TV sits idle.",
+                            val: self.config.screensaver_style.label().to_string(),
+                            is_on: self.config.ambient_timeout_secs > 0,
+                            icon_id: 8,
+                            kind: 1,
+                        },
+                        SettingRow {
+                            label: "Ambient Clock Timer",
+                            desc: "Idle timeout before Astryx dims the home grid into the static centered screensaver.",
+                            val: match self.config.ambient_timeout_secs {
+                                0 => "OFF".to_string(),
+                                60 => "1 min".to_string(),
+                                180 => "3 min".to_string(),
+                                _ => "5 min".to_string(),
+                            },
+                            is_on: self.config.ambient_timeout_secs > 0,
+                            icon_id: 3,
+                            kind: 1,
+                        },
+                        SettingRow {
+                            label: "App Icon Size",
+                            desc: "Scale home screen app tiles for comfortable 10-foot living-room readability.",
+                            val: self.config.icon_size.label().to_string(),
+                            is_on: true,
+                            icon_id: 1,
+                            kind: 1,
+                        },
+                        SettingRow {
+                            label: "Clock & Weather Header",
+                            desc: "Display live time, date, and weather headline in the top-left of the home screen.",
+                            val: if self.config.show_header { "ON" } else { "OFF" }.to_string(),
+                            is_on: self.config.show_header,
+                            icon_id: 3,
+                            kind: 0,
+                        },
+                        SettingRow {
+                            label: "Show App Labels",
+                            desc: "Display app names underneath each icon tile on the home screen.",
+                            val: if self.config.show_labels { "ON" } else { "OFF" }.to_string(),
+                            is_on: self.config.show_labels,
+                            icon_id: 5,
+                            kind: 0,
+                        },
+                        SettingRow {
+                            label: "Auto Night Dimming",
+                            desc: "Gently dim background wallpaper luminance during late evening viewing hours.",
+                            val: if self.config.auto_night_dim { "ON" } else { "OFF" }.to_string(),
+                            is_on: self.config.auto_night_dim,
+                            icon_id: 8,
+                            kind: 0,
+                        },
+                        SettingRow {
+                            label: "Lightweight Mode",
+                            desc: "Reduce tessellation detail and shader glow for lowest CPU/VRAM usage on older TVs.",
+                            val: if self.config.lightweight_mode { "ON" } else { "OFF" }.to_string(),
+                            is_on: self.config.lightweight_mode,
+                            icon_id: 14,
+                            kind: 0,
+                        },
+                    ],
+                    // Tab 1: Weather & HUD (6 items)
+                    1 => vec![
+                        SettingRow {
+                            label: "Live Weather Forecast",
+                            desc: "Fetch and show real-time temperature and sky conditions in the header and ambient clock.",
+                            val: if self.config.show_weather { "ON" } else { "OFF" }.to_string(),
+                            is_on: self.config.show_weather,
+                            icon_id: 4,
+                            kind: 0,
+                        },
+                        SettingRow {
+                            label: "Weather City",
+                            desc: "Choose the city coordinates used for local forecast and temperature readouts.",
+                            val: self
+                                .config
+                                .weather_city
+                                .split('·')
+                                .next()
+                                .unwrap_or("London")
+                                .trim()
+                                .to_string(),
+                            is_on: true,
+                            icon_id: 4,
+                            kind: 2,
+                        },
+                        SettingRow {
+                            label: "24-Hour UK Clock",
+                            desc: "Display 24-hour time (21:42) instead of 12-hour AM/PM formatting.",
+                            val: if self.config.clock_24h { "24h" } else { "12h" }.to_string(),
+                            is_on: self.config.clock_24h,
+                            icon_id: 6,
+                            kind: 0,
+                        },
+                        SettingRow {
+                            label: "Live Status Pill",
+                            desc: "Show compact Wi-Fi, VPN shield, and free memory indicator on the home screen.",
+                            val: if self.config.show_status_pill { "ON" } else { "OFF" }.to_string(),
+                            is_on: self.config.show_status_pill,
+                            icon_id: 7,
+                            kind: 0,
+                        },
+                        SettingRow {
+                            label: "Now Playing Pill",
+                            desc: "Surface active music or media playback status directly on the home screen.",
+                            val: if self.config.show_now_playing { "ON" } else { "OFF" }.to_string(),
+                            is_on: self.config.show_now_playing,
+                            icon_id: 7,
+                            kind: 0,
+                        },
+                        SettingRow {
+                            label: "Performance HUD Overlay",
+                            desc: "Configure the floating FPS, refresh rate, network, RAM, CPU, and GPU telemetry bar.",
+                            val: if self.config.show_fps_meter { "ON" } else { "OFF" }.to_string(),
+                            is_on: self.config.show_fps_meter,
+                            icon_id: 14,
+                            kind: 2,
+                        },
+                    ],
+                    // Tab 2: Gemini AI (6 items)
+                    2 => vec![
+                        SettingRow {
+                            label: "Gemini AI & Top-Bar Icon",
+                            desc: "Enable the multi-color Gemini star in the home screen dock for instant voice chat.",
+                            val: if self.config.gemini_enabled { "ON" } else { "OFF" }.to_string(),
+                            is_on: self.config.gemini_enabled,
+                            icon_id: 203,
+                            kind: 0,
+                        },
+                        SettingRow {
+                            label: "Gemini Model",
+                            desc: "Cycle Interactions API models for voice assistant speed vs deep reasoning quality.",
+                            val: self.config.gemini_model.clone(),
+                            is_on: true,
+                            icon_id: 101,
+                            kind: 1,
+                        },
+                        SettingRow {
+                            label: "Launch Voice Orb",
+                            desc: "Open the floating 60fps liquid-plasma voice orb immediately (press BACK or HOME to exit).",
+                            val: "Start".to_string(),
+                            is_on: has_key && self.config.gemini_enabled,
+                            icon_id: 203,
+                            kind: 2,
+                        },
+                        SettingRow {
+                            label: "API Key & Text Prompts",
+                            desc: "Open the full Gemini AI sheet for Phone Companion API key setup and typed prompts.",
+                            val: if has_key { "Configured" } else { "Set Key" }.to_string(),
+                            is_on: has_key,
+                            icon_id: 200,
+                            kind: 2,
+                        },
+                        SettingRow {
+                            label: "Quick Voice: What to Watch",
+                            desc: "Ask Gemini aloud for 3 curated movie or show picks to watch tonight on your TV.",
+                            val: "Run".to_string(),
+                            is_on: false,
+                            icon_id: 13,
+                            kind: 2,
+                        },
+                        SettingRow {
+                            label: "Clear Chat & A2UI Surfaces",
+                            desc: "Reset Gemini multi-turn conversation memory and remove custom generated A2UI cards.",
+                            val: "Reset".to_string(),
+                            is_on: false,
+                            icon_id: 12,
+                            kind: 2,
+                        },
+                    ],
+                    // Tab 3: Apps & Library (6 items)
+                    3 => vec![
+                        SettingRow {
+                            label: "App Sort Order",
+                            desc: "Order your app library alphabetically (A–Z) or by most recently launched apps first.",
+                            val: match self.config.sort_order {
+                                SortOrder::Alpha => "A–Z".to_string(),
+                                SortOrder::Recent => "Recent".to_string(),
+                            },
+                            is_on: true,
+                            icon_id: 2,
+                            kind: 1,
+                        },
+                        SettingRow {
+                            label: "App Folders",
+                            desc: "Organize streaming, gaming, and utility apps into clean custom home folders.",
+                            val: format!("{} folders", self.config.app_folders.len()),
+                            is_on: !self.config.app_folders.is_empty(),
+                            icon_id: 201,
+                            kind: 2,
+                        },
+                        SettingRow {
+                            label: "Mobile / Sideloaded Apps",
+                            desc: "Include sideloaded phone APKs without Android TV Leanback banners in your library.",
+                            val: if self.config.show_mobile_apps { "ON" } else { "OFF" }.to_string(),
+                            is_on: self.config.show_mobile_apps,
+                            icon_id: 9,
+                            kind: 0,
+                        },
+                        SettingRow {
+                            label: "System Apps",
+                            desc: "Reveal built-in Android TV system packages alongside your installed apps.",
+                            val: if self.config.show_system_apps { "ON" } else { "OFF" }.to_string(),
+                            is_on: self.config.show_system_apps,
+                            icon_id: 10,
+                            kind: 0,
+                        },
+                        SettingRow {
+                            label: "Auto-Clear RAM on Home",
+                            desc: "Automatically trim idle background processes whenever you return to Astryx Home.",
+                            val: if self.config.auto_clear_ram_on_home { "ON" } else { "OFF" }.to_string(),
+                            is_on: self.config.auto_clear_ram_on_home,
+                            icon_id: 101,
+                            kind: 0,
+                        },
+                        SettingRow {
+                            label: "Restore Hidden Apps",
+                            desc: "Unhide any apps you previously concealed from the home screen grid.",
+                            val: format!("Unhide ({})", self.config.hidden_apps.len()),
+                            is_on: !self.config.hidden_apps.is_empty(),
+                            icon_id: 12,
+                            kind: 2,
+                        },
+                    ],
+                    // Tab 4: System & Power (7 items)
+                    _ => vec![
+                        SettingRow {
+                            label: "Startup Options",
+                            desc: "Choose whether booting stays on Astryx Home, launches an app, or switches HDMI input.",
+                            val: self.config.startup_mode.label().to_string(),
+                            is_on: self.config.startup_mode != StartupMode::Home,
+                            icon_id: 100,
+                            kind: 2,
+                        },
+                        SettingRow {
+                            label: "Default Home Launcher",
+                            desc: "Open Android TV Home App picker to verify or set Astryx as your default launcher.",
+                            val: if self.is_default_home {
+                                "Active".to_string()
+                            } else {
+                                "Set Default".to_string()
+                            },
+                            is_on: self.is_default_home,
+                            icon_id: 11,
+                            kind: 2,
+                        },
+                        SettingRow {
+                            label: "Power & Devices",
+                            desc: "Access TV sleep, reboot, Bluetooth remotes, and connected display device controls.",
+                            val: "BT · Sleep".to_string(),
+                            is_on: false,
+                            icon_id: 100,
+                            kind: 2,
+                        },
+                        SettingRow {
+                            label: "Phone Companion",
+                            desc: "Control settings, upload 4K wallpapers, paste API keys, or talk to Gemini from your phone.",
+                            val: format!(":{}", WEB_COMPANION_PORT),
+                            is_on: self.config.web_companion_enabled,
+                            icon_id: 200,
+                            kind: 2,
+                        },
+                        SettingRow {
+                            label: "Backup & Restore",
+                            desc: "Export or import your full Astryx launcher configuration as a portable JSON snapshot.",
+                            val: "JSON".to_string(),
+                            is_on: false,
+                            icon_id: 102,
+                            kind: 2,
+                        },
+                        SettingRow {
+                            label: "App Updates",
+                            desc: "Check GitHub Releases for newer Astryx Rust Launcher builds and install OTA.",
+                            val: match &self.updater_state {
+                                UpdaterState::Available(r) => format!("v{} NEW", r.version),
+                                UpdaterState::Downloading { .. } => "Downloading".to_string(),
+                                UpdaterState::ReadyToInstall { .. }
+                                | UpdaterState::NeedPermission { .. } => "Install".to_string(),
+                                UpdaterState::Checking => "Checking...".to_string(),
+                                _ => format!("v{}", self.app_version),
+                            },
+                            is_on: self.has_update_available(),
+                            icon_id: 13,
+                            kind: 2,
+                        },
+                        SettingRow {
+                            label: "Buy Me a Coffee",
+                            desc: "Support independent pure-Rust Android TV development via QR code.",
+                            val: "Support".to_string(),
+                            is_on: false,
+                            icon_id: 15,
+                            kind: 2,
+                        },
+                    ],
+                };
+
+                let row_count = rows.len();
+                if self.modal_focus >= row_count {
+                    self.modal_focus = row_count.saturating_sub(1);
+                }
+
+                // D-Pad Input Handling across Ribbon / List / QuickBar
+                let mut activate_list: Option<(usize, usize)> = None;
+                let mut activate_quick: Option<usize> = None;
+                let mut close_now = false;
+
                 if allow_keys {
                     ctx.input(|i| {
                         let up = i.key_pressed(Key::ArrowUp);
@@ -4029,925 +5716,1370 @@ impl AstryxTvApp {
                         let right = i.key_pressed(Key::ArrowRight);
                         let ok = i.key_pressed(Key::Enter) || i.key_pressed(Key::Space);
 
-                        if is_grid {
-                            if self.modal_focus == SYS_IDX {
+                        match self.settings_zone {
+                            SettingsZone::Ribbon => {
                                 if left {
-                                    self.settings_sys_col = self.settings_sys_col.saturating_sub(1);
-                                } else if right {
-                                    self.settings_sys_col = (self.settings_sys_col + 1).min(3);
-                                } else if up {
-                                    self.modal_focus = SETTING_COUNT - 1;
-                                    self.modal_focus_changed = true;
-                                } else if ok {
-                                    trigger = true;
-                                }
-                            } else {
-                                let col = self.modal_focus % GRID_COLS;
-                                if left && col > 0 {
-                                    self.modal_focus -= 1;
-                                    self.modal_focus_changed = true;
-                                } else if right && col + 1 < GRID_COLS && self.modal_focus + 1 < SETTING_COUNT {
-                                    self.modal_focus += 1;
-                                    self.modal_focus_changed = true;
-                                } else if up {
-                                    if self.modal_focus >= GRID_COLS {
-                                        self.modal_focus -= GRID_COLS;
+                                    self.settings_ribbon_focus =
+                                        self.settings_ribbon_focus.saturating_sub(1);
+                                    if self.settings_ribbon_focus < TABS.len() {
+                                        self.settings_tab = self.settings_ribbon_focus;
+                                        self.modal_focus = 0;
                                         self.modal_focus_changed = true;
-                                    } else {
-                                        self.modal_close_focused = true;
+                                    }
+                                } else if right {
+                                    self.settings_ribbon_focus =
+                                        (self.settings_ribbon_focus + 1).min(TABS.len());
+                                    if self.settings_ribbon_focus < TABS.len() {
+                                        self.settings_tab = self.settings_ribbon_focus;
+                                        self.modal_focus = 0;
+                                        self.modal_focus_changed = true;
                                     }
                                 } else if down {
-                                    if self.modal_focus + GRID_COLS < SETTING_COUNT {
-                                        self.modal_focus += GRID_COLS;
-                                    } else if self.modal_focus / GRID_COLS < (SETTING_COUNT - 1) / GRID_COLS {
-                                        self.modal_focus = SETTING_COUNT - 1;
-                                    } else {
-                                        self.modal_focus = SYS_IDX;
-                                    }
+                                    self.settings_zone = SettingsZone::List;
                                     self.modal_focus_changed = true;
                                 } else if ok {
-                                    trigger = true;
+                                    if self.settings_ribbon_focus == TABS.len() {
+                                        close_now = true;
+                                    } else {
+                                        self.settings_tab = self.settings_ribbon_focus;
+                                        self.settings_zone = SettingsZone::List;
+                                        self.modal_focus_changed = true;
+                                    }
                                 }
                             }
-                        } else {
-                            if down {
-                                self.modal_focus = (self.modal_focus + 1).min(SYS_IDX);
-                                self.modal_focus_changed = true;
-                            } else if up {
-                                if self.modal_focus == 0 {
-                                    self.modal_close_focused = true;
-                                } else {
-                                    self.modal_focus -= 1;
-                                    self.modal_focus_changed = true;
+                            SettingsZone::List => {
+                                if up {
+                                    if self.modal_focus == 0 {
+                                        self.settings_zone = SettingsZone::Ribbon;
+                                        self.settings_ribbon_focus = self.settings_tab;
+                                    } else {
+                                        self.modal_focus -= 1;
+                                        self.modal_focus_changed = true;
+                                    }
+                                } else if down {
+                                    if self.modal_focus + 1 < row_count {
+                                        self.modal_focus += 1;
+                                        self.modal_focus_changed = true;
+                                    }
+                                } else if left {
+                                    self.settings_zone = SettingsZone::Ribbon;
+                                    self.settings_ribbon_focus = self.settings_tab;
+                                } else if right {
+                                    self.settings_zone = SettingsZone::QuickBar;
+                                    self.settings_sys_col = 0;
+                                } else if ok {
+                                    activate_list = Some((self.settings_tab, self.modal_focus));
                                 }
-                            } else if left {
-                                left_key = true;
-                            } else if right {
-                                right_key = true;
-                            } else if ok {
-                                trigger = true;
+                            }
+                            SettingsZone::QuickBar => {
+                                if self.settings_sys_col < 4 {
+                                    if left {
+                                        if self.settings_sys_col == 0 {
+                                            self.settings_zone = SettingsZone::List;
+                                        } else {
+                                            self.settings_sys_col -= 1;
+                                        }
+                                    } else if right {
+                                        self.settings_sys_col = (self.settings_sys_col + 1).min(3);
+                                    } else if down {
+                                        self.settings_sys_col = 4;
+                                    } else if up {
+                                        self.settings_zone = SettingsZone::Ribbon;
+                                        self.settings_ribbon_focus = self.settings_tab;
+                                    } else if ok {
+                                        activate_quick = Some(self.settings_sys_col);
+                                    }
+                                } else {
+                                    // settings_sys_col == 4 (Boost RAM full-width button)
+                                    if up {
+                                        self.settings_sys_col = 0;
+                                    } else if left {
+                                        self.settings_zone = SettingsZone::List;
+                                    } else if ok {
+                                        activate_quick = Some(4);
+                                    }
+                                }
                             }
                         }
                     });
                 }
 
-                let apply_setting = |this: &mut Self, idx: usize| match idx {
-                    // Category 1: LAYOUT, THEME & PERFORMANCE (0..9)
-                    0 => {
-                        this.open_modal(ActiveModal::Theme);
-                    }
-                    1 => {
-                        this.config.layout_style = match this.config.layout_style {
-                            LayoutStyle::Zenith => LayoutStyle::Classic,
-                            LayoutStyle::Classic => LayoutStyle::Zenith,
-                        };
-                        this.save_config();
-                        this.show_toast(format!("Switched to {}", this.config.layout_style.label()));
-                    }
-                    2 => {
-                        this.config.settings_view = match this.config.settings_view {
-                            SettingsViewMode::Grid => SettingsViewMode::List,
-                            SettingsViewMode::List => SettingsViewMode::Grid,
-                        };
-                        this.save_config();
-                    }
-                    3 => {
-                        this.config.icon_size = match this.config.icon_size {
-                            IconSize::Compact => IconSize::Standard,
-                            IconSize::Standard => IconSize::Large,
-                            IconSize::Large => IconSize::Compact,
-                        };
-                        this.save_config();
-                    }
-                    4 => {
-                        this.config.lightweight_mode = !this.config.lightweight_mode;
-                        let tol = if this.config.lightweight_mode { 0.6 } else { 0.2 };
-                        ctx.options_mut(|o| {
-                            o.tessellation_options.bezier_tolerance = tol;
-                        });
-                        this.wallpaper_tex = None;
-                        this.wallpaper_loading = None;
-                        this.save_config();
-                        this.ensure_wallpaper(ctx.clone());
-                        this.show_toast(if this.config.lightweight_mode {
-                            "Lightweight Mode ON (low CPU/VRAM for older TVs)"
-                        } else {
-                            "Full 4K Quality Mode ON"
-                        });
-                    }
-                    5 => {
-                        this.config.show_header = !this.config.show_header;
-                        this.save_config();
-                    }
-                    6 => {
-                        this.config.show_labels = !this.config.show_labels;
-                        this.save_config();
-                    }
-                    7 => {
-                        this.config.auto_night_dim = !this.config.auto_night_dim;
-                        this.save_config();
-                    }
-                    8 => {
-                        this.config.ambient_timeout_secs = match this.config.ambient_timeout_secs {
-                            0 => 60,
-                            60 => 180,
-                            180 => 300,
-                            _ => 0,
-                        };
-                        this.save_config();
-                    }
-                    // Category 2: WEATHER & HUD STATUS (9..15)
-                    9 => {
-                        this.config.show_weather = !this.config.show_weather;
-                        this.save_config();
-                    }
-                    10 => {
-                        this.open_modal(ActiveModal::WeatherCity);
-                    }
-                    11 => {
-                        this.config.clock_24h = !this.config.clock_24h;
-                        this.save_config();
-                    }
-                    12 => {
-                        this.config.show_status_pill = !this.config.show_status_pill;
-                        this.save_config();
-                    }
-                    13 => {
-                        this.config.show_now_playing = !this.config.show_now_playing;
-                        this.save_config();
-                    }
-                    14 => {
-                        this.open_modal(ActiveModal::Overlay);
-                    }
-                    // Category 3: APPS & LIBRARY (15..21)
-                    15 => {
-                        this.config.sort_order = match this.config.sort_order {
-                            SortOrder::Alpha => SortOrder::Recent,
-                            SortOrder::Recent => SortOrder::Alpha,
-                        };
-                        this.save_config();
-                    }
-                    16 => {
-                        this.active_folder_idx = None;
-                        this.open_modal(ActiveModal::Folders);
-                    }
-                    17 => {
-                        this.config.show_mobile_apps = !this.config.show_mobile_apps;
-                        this.save_config();
-                    }
-                    18 => {
-                        this.config.show_system_apps = !this.config.show_system_apps;
-                        this.save_config();
-                    }
-                    19 => {
-                        this.config.hidden_apps.clear();
-                        this.save_config();
-                        this.show_toast("Restored all hidden apps");
-                    }
-                    20 => {
-                        this.config.auto_clear_ram_on_home = !this.config.auto_clear_ram_on_home;
-                        this.save_config();
-                    }
-                    // Category 4: SYSTEM, STARTUP & UPDATES (21..28)
-                    21 => {
-                        this.open_modal(ActiveModal::StartupOptions);
-                    }
-                    22 => {
-                        let ok = bridge::open_home_settings();
-                        if !ok {
-                            this.show_toast("Open Android Settings → Apps → Default Home");
-                        }
-                    }
-                    23 => {
-                        this.open_modal(ActiveModal::PowerMenu);
-                    }
-                    24 => {
-                        this.local_ip = bridge::get_local_ip();
-                        this.open_modal(ActiveModal::PhoneCompanion);
-                    }
-                    25 => {
-                        this.open_modal(ActiveModal::Backup);
-                    }
-                    26 => {
-                        this.open_modal(ActiveModal::Updater);
-                        if matches!(
-                            this.updater_state,
-                            UpdaterState::Idle | UpdaterState::Error(_)
-                        ) {
-                            this.spawn_check_update(ctx.clone(), false);
-                        }
-                    }
-                    27 => {
-                        this.open_modal(ActiveModal::Donate);
-                    }
-                    28 => {
-                        this.config.gemini_enabled = !this.config.gemini_enabled;
-                        if !this.config.gemini_enabled {
-                            this.gemini_reply.clear();
-                            this.gemini_last_id = None;
-                        }
-                        this.save_config();
-                        this.show_toast(if this.config.gemini_enabled {
-                            "Gemini AI ON"
-                        } else {
-                            "Gemini AI OFF"
-                        });
-                    }
-                    _ => {}
-                };
-
-                if self.modal_focus == SYS_IDX {
-                    if !is_grid {
-                        if left_key {
-                            self.settings_sys_col = self.settings_sys_col.saturating_sub(1);
-                        } else if right_key {
-                            self.settings_sys_col = (self.settings_sys_col + 1).min(3);
-                        }
-                    }
-                    if trigger {
-                        let sec = match self.settings_sys_col {
-                            0 => "network",
-                            1 => "apps",
-                            2 => "display",
-                            _ => "main",
-                        };
-                        bridge::open_system_settings(sec);
-                    }
-                } else if trigger || (!is_grid && (left_key || right_key)) {
-                    apply_setting(self, self.modal_focus);
+                if close_now {
+                    self.close_modal_step();
+                    return;
                 }
 
-                let modal_title = if is_grid {
-                    "Launcher Settings  ·  D-Pad navigate · OK toggle"
+                // Scrim & smooth modal pop-in scaling
+                let screen = ctx.screen_rect();
+                let dim = ctx.layer_painter(egui::LayerId::new(
+                    egui::Order::Middle,
+                    egui::Id::new("settings_ribbon_scrim"),
+                ));
+                dim.rect_filled(screen, 0.0, Color32::from_rgba_unmultiplied(4, 6, 14, 182));
+
+                let fill = self.config.modal_fill();
+                let accent = self.config.accent();
+                let pop_scale = if self.config.modal_pop_in && !self.config.lightweight_mode {
+                    let el = self.modal_opened_at.elapsed().as_secs_f32();
+                    if el < 0.085 {
+                        ctx.request_repaint();
+                        let frac = (el / 0.085).clamp(0.0, 1.0);
+                        let ease = 1.0 - (1.0 - frac).powi(3);
+                        0.94 + 0.06 * ease
+                    } else {
+                        1.0
+                    }
                 } else {
-                    "Launcher Settings  ·  Up/Down move · OK toggle"
+                    1.0
                 };
 
-                self.draw_modal_shell(
-                    ctx,
-                    modal_title,
-                    820.0,
-                    465.0,
-                    |this, ui, _ctx| {
-                        let accent = this.config.accent();
+                let stage_w = ((screen.width() - 44.0).min(912.0)) * pop_scale;
+                let stage_h = ((screen.height() - 62.0).min(472.0)) * pop_scale;
+                let ribbon_h = 48.0_f32;
+                let gap_v = 12.0_f32;
+                let gap_h = 12.0_f32;
+                let body_h = (stage_h - ribbon_h - gap_v).max(320.0);
+                let left_w = ((stage_w - gap_h) * 0.575).floor();
+                let right_w = (stage_w - gap_h - left_w).floor();
+                let stage_origin = Pos2::new(
+                    (screen.center().x - stage_w * 0.5).round(),
+                    (screen.center().y - stage_h * 0.5 - 6.0).round().max(14.0),
+                );
 
-                        // 3-Card Live Telemetry Bar (Device · RAM · Storage) with crisp vector icons
-                        ui.columns(3, |cols| {
-                            let card = |ui: &mut Ui, icon_id: usize, title: &str, val: String, ratio: Option<f32>, bar_c: Color32| {
+                let mut clicked_tab: Option<usize> = None;
+                let mut clicked_close = false;
+
+                egui::Area::new(egui::Id::new("settings_cinema_stage"))
+                    .fixed_pos(stage_origin)
+                    .order(egui::Order::Foreground)
+                    .show(ctx, |ui| {
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(stage_w, stage_h),
+                            egui::Layout::top_down(Align::LEFT),
+                            |ui| {
+                                ui.spacing_mut().item_spacing = Vec2::ZERO;
+
+                                // -------------------------------------------------------------
+                                // 1. TOP FLOATING CINEMA RIBBON
+                                // -------------------------------------------------------------
                                 egui::Frame::NONE
-                                    .fill(Color32::from_rgba_unmultiplied(255, 255, 255, 13))
+                                    .fill(fill)
                                     .stroke(Stroke::new(
-                                        1.0_f32,
-                                        Color32::from_rgba_unmultiplied(255, 255, 255, 24),
+                                        1.3_f32,
+                                        Color32::from_rgba_unmultiplied(255, 255, 255, 48),
                                     ))
-                                    .corner_radius(CornerRadius::same(12))
-                                    .inner_margin(egui::Margin::symmetric(12, 8))
+                                    .corner_radius(CornerRadius::same(16))
+                                    .inner_margin(egui::Margin::symmetric(14, 7))
                                     .show(ui, |ui| {
-                                        ui.set_min_width(ui.available_width());
-                                        ui.horizontal(|ui| {
-                                            let (ir, _) = ui.allocate_exact_size(Vec2::splat(22.0), Sense::hover());
-                                            ui.painter().circle_filled(
-                                                ir.center(),
-                                                11.0,
-                                                Color32::from_rgba_unmultiplied(bar_c.r(), bar_c.g(), bar_c.b(), 36),
-                                            );
-                                            Self::draw_setting_icon(ui.painter(), ir.center(), icon_id, bar_c);
-                                            ui.vertical(|ui| {
+                                        ui.allocate_ui_with_layout(
+                                            Vec2::new(stage_w - 28.0, ribbon_h - 14.0),
+                                            egui::Layout::left_to_right(Align::Center),
+                                            |ui| {
+                                                // Brand mark
                                                 ui.label(
-                                                    RichText::new(title)
-                                                        .font(FontId::proportional(9.5))
-                                                        .strong()
-                                                        .color(Color32::from_rgb(165, 182, 210)),
-                                                );
-                                                ui.label(
-                                                    RichText::new(val)
-                                                        .font(FontId::proportional(12.0))
+                                                    RichText::new("ASTRYX")
+                                                        .font(FontId::proportional(13.5))
                                                         .strong()
                                                         .color(Color32::WHITE),
                                                 );
-                                            });
-                                        });
-                                        if let Some(r) = ratio {
-                                            ui.add_space(4.0);
-                                            let (bar_rect, _) = ui.allocate_exact_size(
-                                                Vec2::new(ui.available_width(), 4.0),
-                                                Sense::hover(),
-                                            );
-                                            let p = ui.painter();
-                                            p.rect_filled(
-                                                bar_rect,
-                                                CornerRadius::same(2),
-                                                Color32::from_rgba_unmultiplied(255, 255, 255, 24),
-                                            );
-                                            let mut fill_r = bar_rect;
-                                            fill_r.set_width((bar_rect.width() * r.clamp(0.05, 1.0)).max(4.0));
-                                            p.rect_filled(fill_r, CornerRadius::same(2), bar_c);
-                                        }
-                                    });
-                            };
-
-                            card(
-                                &mut cols[0],
-                                100,
-                                "DEVICE",
-                                format!(
-                                    "{} · Android {} · {:.0}Hz",
-                                    this.status.device_model, this.status.android_version, this.display_hz
-                                ),
-                                None,
-                                accent,
-                            );
-                            let ram_used = (this.status.ram_total_mb - this.status.ram_free_mb).max(0) as f32
-                                / (this.status.ram_total_mb.max(1) as f32);
-                            card(
-                                &mut cols[1],
-                                101,
-                                "MEMORY (RAM)",
-                                format!("{} / {} MB free", this.status.ram_free_mb, this.status.ram_total_mb),
-                                Some(ram_used),
-                                accent,
-                            );
-                            let sto_used = ((this.status.storage_total_gb - this.status.storage_free_gb).max(0.0)
-                                / this.status.storage_total_gb.max(0.1)) as f32;
-                            card(
-                                &mut cols[2],
-                                102,
-                                "STORAGE",
-                                format!("{:.1} / {:.1} GB free", this.status.storage_free_gb, this.status.storage_total_gb),
-                                Some(sto_used),
-                                Color32::from_rgb(52, 211, 153),
-                            );
-                        });
-                        ui.add_space(10.0);
-
-                        // (label, value, is_on, icon_id) — grouped cleanly into 4 categories with Theme & Glass merged in!
-                        let rows: [(&str, String, bool, usize); SETTING_COUNT] = [
-                            // LAYOUT, THEME & PERFORMANCE (0..9)
-                            (
-                                "Theme & Glass",
-                                this.config.astryx_theme.label().replace("Astryx ", ""),
-                                true,
-                                201,
-                            ),
-                            ("Layout Style", this.config.layout_style.label().to_string(), true, 0),
-                            ("Settings View", this.config.settings_view.label().to_string(), true, 201),
-                            ("Icon Size", this.config.icon_size.label().to_string(), true, 1),
-                            (
-                                "Lightweight Mode",
-                                if this.config.lightweight_mode { "ON" } else { "OFF" }.to_string(),
-                                this.config.lightweight_mode,
-                                14,
-                            ),
-                            (
-                                "Clock & Weather Header",
-                                if this.config.show_header { "ON" } else { "OFF" }.to_string(),
-                                this.config.show_header,
-                                3,
-                            ),
-                            (
-                                "Show App Labels",
-                                if this.config.show_labels { "ON" } else { "OFF" }.to_string(),
-                                this.config.show_labels,
-                                5,
-                            ),
-                            (
-                                "Auto Night Dimming",
-                                if this.config.auto_night_dim { "ON" } else { "OFF" }.to_string(),
-                                this.config.auto_night_dim,
-                                8,
-                            ),
-                            (
-                                "Ambient Clock",
-                                match this.config.ambient_timeout_secs {
-                                    0 => "OFF".to_string(),
-                                    60 => "1 min".to_string(),
-                                    180 => "3 min".to_string(),
-                                    _ => "5 min".to_string(),
-                                },
-                                this.config.ambient_timeout_secs > 0,
-                                8,
-                            ),
-                            // WEATHER & HUD STATUS (9..15)
-                            (
-                                "Live Weather",
-                                if this.config.show_weather { "ON" } else { "OFF" }.to_string(),
-                                this.config.show_weather,
-                                4,
-                            ),
-                            (
-                                "Weather City",
-                                this.config
-                                    .weather_city
-                                    .split('·')
-                                    .next()
-                                    .unwrap_or("London")
-                                    .trim()
-                                    .to_string(),
-                                true,
-                                4,
-                            ),
-                            (
-                                "24-Hour UK Clock",
-                                if this.config.clock_24h { "24h" } else { "12h" }.to_string(),
-                                this.config.clock_24h,
-                                6,
-                            ),
-                            (
-                                "Live Status Pill",
-                                if this.config.show_status_pill { "ON" } else { "OFF" }.to_string(),
-                                this.config.show_status_pill,
-                                7,
-                            ),
-                            (
-                                "Now Playing Pill",
-                                if this.config.show_now_playing { "ON" } else { "OFF" }.to_string(),
-                                this.config.show_now_playing,
-                                7,
-                            ),
-                            (
-                                "HUD Overlay",
-                                if this.config.show_fps_meter { "ON" } else { "OFF" }.to_string(),
-                                this.config.show_fps_meter,
-                                14,
-                            ),
-                            // APPS & LIBRARY (15..21)
-                            (
-                                "App Sort Order",
-                                match this.config.sort_order {
-                                    SortOrder::Alpha => "A–Z".to_string(),
-                                    SortOrder::Recent => "Recent".to_string(),
-                                },
-                                true,
-                                2,
-                            ),
-                            (
-                                "App Folders",
-                                format!("{} folders", this.config.app_folders.len()),
-                                !this.config.app_folders.is_empty(),
-                                201,
-                            ),
-                            (
-                                "Mobile / Sideloaded",
-                                if this.config.show_mobile_apps { "ON" } else { "OFF" }.to_string(),
-                                this.config.show_mobile_apps,
-                                9,
-                            ),
-                            (
-                                "System Apps",
-                                if this.config.show_system_apps { "ON" } else { "OFF" }.to_string(),
-                                this.config.show_system_apps,
-                                10,
-                            ),
-                            (
-                                "Hidden Apps",
-                                format!("Unhide ({})", this.config.hidden_apps.len()),
-                                false,
-                                12,
-                            ),
-                            (
-                                "Auto-Clear RAM",
-                                if this.config.auto_clear_ram_on_home { "ON" } else { "OFF" }.to_string(),
-                                this.config.auto_clear_ram_on_home,
-                                101,
-                            ),
-                            // SYSTEM, STARTUP & UPDATES (21..28)
-                            (
-                                "Startup Options",
-                                this.config.startup_mode.label().to_string(),
-                                this.config.startup_mode != StartupMode::Home,
-                                100,
-                            ),
-                            (
-                                "Default Home",
-                                if this.is_default_home {
-                                    "✓ Default".to_string()
-                                } else {
-                                    "Set Default".to_string()
-                                },
-                                this.is_default_home,
-                                11,
-                            ),
-                            (
-                                "Power & Devices",
-                                "BT · Sleep".to_string(),
-                                false,
-                                100,
-                            ),
-                            (
-                                "Phone Companion",
-                                format!(":{}", WEB_COMPANION_PORT),
-                                this.config.web_companion_enabled,
-                                200,
-                            ),
-                            (
-                                "Backup & Restore",
-                                "JSON".to_string(),
-                                false,
-                                102,
-                            ),
-                            (
-                                "App Updates",
-                                match &this.updater_state {
-                                    UpdaterState::Available(r) => format!("v{} NEW", r.version),
-                                    UpdaterState::Downloading { .. } => "Downloading".to_string(),
-                                    UpdaterState::ReadyToInstall { .. }
-                                    | UpdaterState::NeedPermission { .. } => "Install".to_string(),
-                                    UpdaterState::Checking => "Checking...".to_string(),
-                                    _ => format!("v{}", this.app_version),
-                                },
-                                this.has_update_available(),
-                                13,
-                            ),
-                            (
-                                "Buy Me a Coffee",
-                                "Support".to_string(),
-                                false,
-                                15,
-                            ),
-                            (
-                                "Gemini AI",
-                                if this.config.gemini_enabled {
-                                    "ON"
-                                } else {
-                                    "OFF"
-                                }
-                                .to_string(),
-                                this.config.gemini_enabled,
-                                200,
-                            ),
-                        ];
-
-                        let is_submenu_item = |idx: usize| {
-                            matches!(idx, 0 | 10 | 14 | 16 | 21 | 22 | 23 | 24 | 25 | 26 | 27)
-                        };
-
-                        let category_for = |idx: usize| -> Option<&'static str> {
-                            match idx {
-                                0 => Some("LAYOUT, THEME & PERFORMANCE"),
-                                9 => Some("WEATHER & HUD STATUS"),
-                                15 => Some("APPS & LIBRARY"),
-                                21 => Some("SYSTEM, STARTUP & UPDATES"),
-                                _ => None,
-                            }
-                        };
-
-                        let draw_category_header = |ui: &mut Ui, title: &str, top_gap: bool| {
-                            if top_gap {
-                                ui.add_space(6.0);
-                            }
-                            ui.horizontal(|ui| {
-                                let (bar_r, _) =
-                                    ui.allocate_exact_size(Vec2::new(4.0, 13.0), Sense::hover());
-                                ui.painter().rect_filled(bar_r, CornerRadius::same(2), accent);
-                                ui.label(
-                                    RichText::new(title)
-                                        .font(FontId::proportional(10.5))
-                                        .strong()
-                                        .color(accent),
-                                );
-                                let avail = ui.available_width();
-                                if avail > 12.0 {
-                                    let (lr, _) =
-                                        ui.allocate_exact_size(Vec2::new(avail, 13.0), Sense::hover());
-                                    let y = lr.center().y;
-                                    ui.painter().line_segment(
-                                        [Pos2::new(lr.left() + 4.0, y), Pos2::new(lr.right(), y)],
-                                        Stroke::new(
-                                            1.0_f32,
-                                            Color32::from_rgba_unmultiplied(255, 255, 255, 22),
-                                        ),
-                                    );
-                                }
-                            });
-                            ui.add_space(4.0);
-                        };
-
-                        let mut clicked_idx: Option<usize> = None;
-
-                        if this.config.settings_view == SettingsViewMode::Grid {
-                            // 3-Column Categorized Glass Card Grid View
-                            for (row_i, chunk) in rows.chunks(GRID_COLS).enumerate() {
-                                let first_idx = row_i * GRID_COLS;
-                                if let Some(cat) = category_for(first_idx) {
-                                    draw_category_header(ui, cat, first_idx > 0);
-                                }
-                                ui.columns(GRID_COLS, |cols| {
-                                    for (c_i, (label, val, is_on, icon_id)) in chunk.iter().enumerate() {
-                                        let idx = row_i * GRID_COLS + c_i;
-                                        let focused = this.modal_focus == idx;
-                                        let is_sub = is_submenu_item(idx);
-                                        let w = cols[c_i].available_width();
-                                        let (rect, resp) = cols[c_i]
-                                            .allocate_exact_size(Vec2::new(w, 60.0), Sense::click());
-                                        let p = cols[c_i].painter();
-
-                                        p.rect_filled(
-                                            rect,
-                                            CornerRadius::same(12),
-                                            if focused {
-                                                Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 48)
-                                            } else if is_sub {
-                                                Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 18)
-                                            } else {
-                                                Color32::from_rgba_unmultiplied(255, 255, 255, 11)
-                                            },
-                                        );
-                                        p.rect_stroke(
-                                            rect,
-                                            CornerRadius::same(12),
-                                            if focused {
-                                                Stroke::new(2.0_f32, accent)
-                                            } else if is_sub {
-                                                Stroke::new(
-                                                    1.1_f32,
-                                                    Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 95),
-                                                )
-                                            } else {
-                                                Stroke::new(
-                                                    1.0_f32,
-                                                    Color32::from_rgba_unmultiplied(255, 255, 255, 20),
-                                                )
-                                            },
-                                            egui::StrokeKind::Inside,
-                                        );
-
-                                        // Top-left frosted circle with color-coded vector icon inside
-                                        let ic_c = Pos2::new(rect.left() + 22.0, rect.top() + 20.0);
-                                        let sc = Self::setting_icon_color(*icon_id);
-                                        p.circle_filled(
-                                            ic_c,
-                                            11.5,
-                                            if focused {
-                                                Color32::from_rgba_unmultiplied(255, 255, 255, 34)
-                                            } else {
-                                                Color32::from_rgba_unmultiplied(255, 255, 255, 18)
-                                            },
-                                        );
-                                        Self::draw_setting_icon(p, ic_c, *icon_id, sc);
-
-                                        // Top-right status pill badge
-                                        let pill_w = (val.len() as f32 * 6.8 + 18.0).clamp(48.0, 108.0);
-                                        let pill_rect = Rect::from_min_size(
-                                            Pos2::new(rect.right() - pill_w - 10.0, rect.top() + 10.0),
-                                            Vec2::new(pill_w, 20.0),
-                                        );
-                                        p.rect_filled(
-                                            pill_rect,
-                                            CornerRadius::same(7),
-                                            if focused {
-                                                Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 115)
-                                            } else if *is_on {
-                                                Color32::from_rgba_unmultiplied(52, 211, 153, 42)
-                                            } else {
-                                                Color32::from_rgba_unmultiplied(255, 255, 255, 16)
-                                            },
-                                        );
-                                        p.text(
-                                            pill_rect.center(),
-                                            Align2::CENTER_CENTER,
-                                            val,
-                                            FontId::proportional(11.0),
-                                            Color32::WHITE,
-                                        );
-
-                                        // Bottom-left bold setting label
-                                        p.text(
-                                            Pos2::new(rect.left() + 12.0, rect.bottom() - 14.0),
-                                            Align2::LEFT_CENTER,
-                                            *label,
-                                            FontId::proportional(12.5),
-                                            if focused { Color32::WHITE } else { Color32::from_rgb(225, 233, 246) },
-                                        );
-
-                                        // Bottom-right sub-menu chevron badge for folder/sub-menu cards
-                                        if is_sub {
-                                            let ch_c = Pos2::new(rect.right() - 18.0, rect.bottom() - 14.0);
-                                            p.circle_filled(
-                                                ch_c,
-                                                8.5,
-                                                if focused {
-                                                    Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 145)
-                                                } else {
-                                                    Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 52)
-                                                },
-                                            );
-                                            let chev_c = if focused { Color32::WHITE } else { accent };
-                                            p.add(egui::Shape::line(
-                                                vec![
-                                                    ch_c + Vec2::new(-1.8, -3.4),
-                                                    ch_c + Vec2::new(2.2, 0.0),
-                                                    ch_c + Vec2::new(-1.8, 3.4),
-                                                ],
-                                                Stroke::new(1.8_f32, chev_c),
-                                            ));
-                                        }
-
-                                        if focused && this.modal_focus_changed {
-                                            resp.scroll_to_me(Some(Align::Center));
-                                            this.modal_focus_changed = false;
-                                        }
-                                        if resp.clicked() {
-                                            this.modal_focus = idx;
-                                            clicked_idx = Some(idx);
-                                        }
-                                    }
-                                });
-                                ui.add_space(6.0);
-                            }
-                        } else {
-                            // Classic Categorized List View
-                            for (idx, (label, val, is_on, icon_id)) in rows.iter().enumerate() {
-                                if let Some(sec) = category_for(idx) {
-                                    draw_category_header(ui, sec, idx > 0);
-                                }
-
-                                let focused = this.modal_focus == idx;
-                                let is_sub = is_submenu_item(idx);
-                                let row_resp = egui::Frame::NONE
-                                    .fill(if focused {
-                                        Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 38)
-                                    } else if is_sub {
-                                        Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 15)
-                                    } else {
-                                        Color32::from_rgba_unmultiplied(255, 255, 255, 9)
-                                    })
-                                    .stroke(if focused {
-                                        Stroke::new(1.5_f32, accent)
-                                    } else if is_sub {
-                                        Stroke::new(
-                                            1.0_f32,
-                                            Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 85),
-                                        )
-                                    } else {
-                                        Stroke::new(
-                                            1.0_f32,
-                                            Color32::from_rgba_unmultiplied(255, 255, 255, 16),
-                                        )
-                                    })
-                                    .corner_radius(CornerRadius::same(10))
-                                    .inner_margin(egui::Margin::symmetric(12, 5))
-                                    .show(ui, |ui| {
-                                        ui.horizontal(|ui| {
-                                            let (dot_r, _) = ui.allocate_exact_size(Vec2::new(5.0, 22.0), Sense::hover());
-                                            if focused {
-                                                ui.painter().rect_filled(
-                                                    Rect::from_center_size(dot_r.center(), Vec2::new(3.5, 18.0)),
-                                                    CornerRadius::same(2),
-                                                    accent,
+                                                ui.add_space(5.0);
+                                                ui.label(
+                                                    RichText::new("/ Settings")
+                                                        .font(FontId::proportional(12.0))
+                                                        .color(Color32::from_rgb(154, 172, 200)),
                                                 );
-                                            }
-                                            let (ic_r, _) = ui.allocate_exact_size(Vec2::splat(24.0), Sense::hover());
-                                            let sc = Self::setting_icon_color(*icon_id);
-                                            ui.painter().circle_filled(
-                                                ic_r.center(),
-                                                11.5,
-                                                if focused {
-                                                    Color32::from_rgba_unmultiplied(255, 255, 255, 32)
-                                                } else {
-                                                    Color32::from_rgba_unmultiplied(255, 255, 255, 16)
-                                                },
-                                            );
-                                            Self::draw_setting_icon(ui.painter(), ic_r.center(), *icon_id, sc);
-                                            ui.add_space(4.0);
-                                            ui.label(
-                                                RichText::new(*label)
-                                                    .font(FontId::proportional(13.5))
-                                                    .strong()
-                                                    .color(if focused {
+                                                ui.add_space(16.0);
+
+                                                // 5 Category Pill Tabs
+                                                let tab_widths = [108.0_f32, 126.0, 100.0, 74.0, 86.0];
+                                                for (t_idx, (t_lbl, t_icon)) in TABS.iter().enumerate() {
+                                                    let is_active = tab == t_idx;
+                                                    let is_focused =
+                                                        self.settings_zone == SettingsZone::Ribbon
+                                                            && self.settings_ribbon_focus == t_idx;
+                                                    let pill_w = tab_widths[t_idx];
+                                                    let (r, resp) = ui.allocate_exact_size(
+                                                        Vec2::new(pill_w, 31.0),
+                                                        Sense::click(),
+                                                    );
+                                                    let p = ui.painter();
+                                                    let bg = if is_focused {
+                                                        Color32::from_rgba_unmultiplied(
+                                                            accent.r(),
+                                                            accent.g(),
+                                                            accent.b(),
+                                                            96,
+                                                        )
+                                                    } else if is_active {
+                                                        Color32::from_rgba_unmultiplied(
+                                                            accent.r(),
+                                                            accent.g(),
+                                                            accent.b(),
+                                                            46,
+                                                        )
+                                                    } else {
+                                                        Color32::from_rgba_unmultiplied(
+                                                            255, 255, 255, 8,
+                                                        )
+                                                    };
+                                                    let stroke = if is_focused {
+                                                        Stroke::new(2.0_f32, Color32::WHITE)
+                                                    } else if is_active {
+                                                        Stroke::new(1.3_f32, accent)
+                                                    } else {
+                                                        Stroke::new(
+                                                            1.0_f32,
+                                                            Color32::from_rgba_unmultiplied(
+                                                                255, 255, 255, 18,
+                                                            ),
+                                                        )
+                                                    };
+                                                    p.rect_filled(r, CornerRadius::same(10), bg);
+                                                    p.rect_stroke(
+                                                        r,
+                                                        CornerRadius::same(10),
+                                                        stroke,
+                                                        egui::StrokeKind::Inside,
+                                                    );
+                                                    let ic_c =
+                                                        Pos2::new(r.left() + 16.0, r.center().y);
+                                                    let ic_col = if is_active || is_focused {
                                                         Color32::WHITE
                                                     } else {
-                                                        Color32::from_rgb(225, 233, 246)
-                                                    }),
-                                            );
-                                            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                                                if is_sub {
-                                                    let (ch_r, _) = ui.allocate_exact_size(Vec2::splat(20.0), Sense::hover());
-                                                    let ch_c = ch_r.center();
-                                                    ui.painter().circle_filled(
-                                                        ch_c,
-                                                        9.0,
-                                                        Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 62),
+                                                        Self::setting_icon_color(*t_icon)
+                                                    };
+                                                    Self::draw_setting_icon(
+                                                        p, ic_c, *t_icon, ic_col,
                                                     );
-                                                    ui.painter().add(egui::Shape::line(
-                                                        vec![
-                                                            ch_c + Vec2::new(-2.0, -3.6),
-                                                            ch_c + Vec2::new(2.2, 0.0),
-                                                            ch_c + Vec2::new(-2.0, 3.6),
-                                                        ],
-                                                        Stroke::new(1.8_f32, if focused { Color32::WHITE } else { accent }),
-                                                    ));
-                                                    ui.add_space(4.0);
+                                                    p.text(
+                                                        Pos2::new(r.left() + 30.0, r.center().y),
+                                                        Align2::LEFT_CENTER,
+                                                        *t_lbl,
+                                                        FontId::proportional(11.8),
+                                                        if is_active || is_focused {
+                                                            Color32::WHITE
+                                                        } else {
+                                                            Color32::from_rgb(198, 212, 232)
+                                                        },
+                                                    );
+                                                    if resp.clicked() {
+                                                        clicked_tab = Some(t_idx);
+                                                    }
+                                                    ui.add_space(6.0);
                                                 }
-                                                let pill_fill = if focused {
-                                                    Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 95)
-                                                } else if *is_on {
-                                                    Color32::from_rgba_unmultiplied(52, 211, 153, 38)
-                                                } else {
-                                                    Color32::from_rgba_unmultiplied(255, 255, 255, 14)
-                                                };
-                                                let pill_stroke = if focused {
-                                                    Stroke::new(1.6_f32, Color32::WHITE)
-                                                } else if *is_on {
-                                                    Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(52, 211, 153, 120))
-                                                } else {
-                                                    Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(255, 255, 255, 24))
-                                                };
-                                                if ui
-                                                    .add(
-                                                        egui::Button::new(
-                                                            RichText::new(val)
+
+                                                // Right side: Live clock + Close (×) button
+                                                ui.with_layout(
+                                                    egui::Layout::right_to_left(Align::Center),
+                                                    |ui| {
+                                                        let close_focused =
+                                                            self.settings_zone == SettingsZone::Ribbon
+                                                                && self.settings_ribbon_focus
+                                                                    == TABS.len();
+                                                        let (cr, cresp) = ui.allocate_exact_size(
+                                                            Vec2::splat(28.0),
+                                                            Sense::click(),
+                                                        );
+                                                        let cp = ui.painter();
+                                                        let cc = cr.center();
+                                                        cp.circle_filled(
+                                                            cc,
+                                                            13.0,
+                                                            if close_focused {
+                                                                accent
+                                                            } else {
+                                                                Color32::from_rgba_unmultiplied(
+                                                                    255, 255, 255, 22,
+                                                                )
+                                                            },
+                                                        );
+                                                        cp.circle_stroke(
+                                                            cc,
+                                                            13.0,
+                                                            if close_focused {
+                                                                Stroke::new(2.0_f32, Color32::WHITE)
+                                                            } else {
+                                                                Stroke::new(
+                                                                    1.0_f32,
+                                                                    Color32::from_rgba_unmultiplied(
+                                                                        accent.r(),
+                                                                        accent.g(),
+                                                                        accent.b(),
+                                                                        155,
+                                                                    ),
+                                                                )
+                                                            },
+                                                        );
+                                                        let xs = Stroke::new(1.9_f32, Color32::WHITE);
+                                                        cp.line_segment(
+                                                            [
+                                                                cc + Vec2::new(-4.2, -4.2),
+                                                                cc + Vec2::new(4.2, 4.2),
+                                                            ],
+                                                            xs,
+                                                        );
+                                                        cp.line_segment(
+                                                            [
+                                                                cc + Vec2::new(4.2, -4.2),
+                                                                cc + Vec2::new(-4.2, 4.2),
+                                                            ],
+                                                            xs,
+                                                        );
+                                                        if cresp.clicked() {
+                                                            clicked_close = true;
+                                                        }
+
+                                                        ui.add_space(10.0);
+                                                        ui.label(
+                                                            RichText::new(&self.cached_time_str)
                                                                 .font(FontId::proportional(12.0))
                                                                 .strong()
-                                                                .color(Color32::WHITE),
-                                                        )
-                                                        .fill(pill_fill)
-                                                        .stroke(pill_stroke)
-                                                        .corner_radius(CornerRadius::same(8))
-                                                        .min_size(Vec2::new(98.0, 26.0)),
-                                                    )
-                                                    .clicked()
-                                                {
-                                                    this.modal_focus = idx;
-                                                    clicked_idx = Some(idx);
-                                                }
-                                            });
-                                        });
-                                    })
-                                    .response;
-                                if focused && this.modal_focus_changed {
-                                    row_resp.scroll_to_me(Some(Align::Center));
-                                    this.modal_focus_changed = false;
-                                }
-                                ui.add_space(3.0);
-                            }
-                        }
+                                                                .color(Color32::from_rgb(
+                                                                    220, 232, 248,
+                                                                )),
+                                                        );
+                                                        ui.add_space(5.0);
+                                                        let (dr, _) = ui.allocate_exact_size(
+                                                            Vec2::splat(8.0),
+                                                            Sense::hover(),
+                                                        );
+                                                        ui.painter().circle_filled(
+                                                            dr.center(),
+                                                            3.2,
+                                                            if self.status.is_connected {
+                                                                Color32::from_rgb(52, 211, 153)
+                                                            } else {
+                                                                Color32::from_rgb(248, 113, 113)
+                                                            },
+                                                        );
+                                                    },
+                                                );
+                                            },
+                                        );
+                                    });
 
-                        if let Some(ci) = clicked_idx {
-                            apply_setting(this, ci);
-                        }
+                                ui.add_space(gap_v);
 
-                        ui.add_space(6.0);
-                        ui.label(
-                            RichText::new("ANDROID TV SHORTCUTS")
-                                .font(FontId::proportional(10.5))
-                                .strong()
-                                .color(accent),
+                                // -------------------------------------------------------------
+                                // 2. 60 / 40 SPLIT GLASS STAGE
+                                // -------------------------------------------------------------
+                                ui.allocate_ui_with_layout(
+                                    Vec2::new(stage_w, body_h),
+                                    egui::Layout::left_to_right(Align::TOP),
+                                    |ui| {
+                                        ui.spacing_mut().item_spacing = Vec2::new(gap_h, 0.0);
+
+                                        // LEFT 60%: Clean Single-Column Settings List Card (explicit top-down!)
+                                        ui.allocate_ui_with_layout(
+                                            Vec2::new(left_w, body_h),
+                                            egui::Layout::top_down(Align::LEFT),
+                                            |ui| {
+                                                egui::Frame::NONE
+                                                    .fill(fill)
+                                                    .stroke(Stroke::new(
+                                                        1.2_f32,
+                                                        Color32::from_rgba_unmultiplied(
+                                                            255, 255, 255, 42,
+                                                        ),
+                                                    ))
+                                                    .corner_radius(CornerRadius::same(18))
+                                                    .inner_margin(egui::Margin::same(12))
+                                                    .show(ui, |ui| {
+                                                        let list_inner_w = left_w - 24.0;
+                                                        let list_inner_h = body_h - 24.0;
+                                                        ui.set_min_size(Vec2::new(
+                                                            list_inner_w,
+                                                            list_inner_h,
+                                                        ));
+                                                        ui.allocate_ui_with_layout(
+                                                            Vec2::new(list_inner_w, list_inner_h),
+                                                            egui::Layout::top_down(Align::LEFT),
+                                                            |ui| {
+                                                                ui.set_min_height(list_inner_h);
+                                                                ui.spacing_mut().item_spacing =
+                                                                    Vec2::new(6.0, 0.0);
+
+                                                                // Section heading bar
+                                                                ui.horizontal(|ui| {
+                                                                    let (bar_r, _) = ui
+                                                                        .allocate_exact_size(
+                                                                            Vec2::new(3.5, 14.0),
+                                                                            Sense::hover(),
+                                                                        );
+                                                                    ui.painter().rect_filled(
+                                                                        bar_r,
+                                                                        CornerRadius::same(2),
+                                                                        accent,
+                                                                    );
+                                                                    ui.label(
+                                                                        RichText::new(
+                                                                            TABS[tab]
+                                                                                .0
+                                                                                .to_uppercase(),
+                                                                        )
+                                                                        .font(FontId::proportional(
+                                                                            11.0,
+                                                                        ))
+                                                                        .strong()
+                                                                        .color(accent),
+                                                                    );
+                                                                    ui.label(
+                                                                        RichText::new(format!(
+                                                                            "· {} items",
+                                                                            rows.len()
+                                                                        ))
+                                                                        .font(FontId::proportional(
+                                                                            10.5,
+                                                                        ))
+                                                                        .color(Color32::from_rgb(
+                                                                            152, 170, 198,
+                                                                        )),
+                                                                    );
+                                                                    ui.with_layout(
+                                                                        egui::Layout::right_to_left(
+                                                                            Align::Center,
+                                                                        ),
+                                                                        |ui| {
+                                                                            ui.label(
+                                                                                RichText::new(
+                                                                                    "UP Tabs  ·  RIGHT Tools",
+                                                                                )
+                                                                                .font(
+                                                                                    FontId::proportional(
+                                                                                        10.0,
+                                                                                    ),
+                                                                                )
+                                                                                .color(
+                                                                                    Color32::from_rgb(
+                                                                                        138, 156,
+                                                                                        184,
+                                                                                    ),
+                                                                                ),
+                                                                            );
+                                                                        },
+                                                                    );
+                                                                });
+                                                                ui.add_space(8.0);
+
+                                                                ScrollArea::vertical()
+                                                                    .id_salt((
+                                                                        "cinema_settings_list",
+                                                                        tab,
+                                                                    ))
+                                                                    .max_height(
+                                                                        list_inner_h - 26.0,
+                                                                    )
+                                                                    .auto_shrink([false, false])
+                                                                    .show(ui, |ui| {
+                                                                        let row_w =
+                                                                            ui.available_width();
+                                                                        for (idx, row) in
+                                                                            rows.iter().enumerate()
+                                                                        {
+                                                                            let focused =
+                                                                                self.settings_zone
+                                                                                    == SettingsZone::List
+                                                                                    && self.modal_focus
+                                                                                        == idx;
+                                                                            let selected_dim =
+                                                                                self.settings_zone
+                                                                                    != SettingsZone::List
+                                                                                    && self.modal_focus
+                                                                                        == idx;
+                                                                            let (rect, resp) = ui
+                                                                                .allocate_exact_size(
+                                                                                    Vec2::new(
+                                                                                        row_w, 45.0,
+                                                                                    ),
+                                                                                    Sense::click(),
+                                                                                );
+                                                                            let p = ui.painter();
+
+                                                                            p.rect_filled(
+                                                                                rect,
+                                                                                CornerRadius::same(
+                                                                                    11,
+                                                                                ),
+                                                                                if focused {
+                                                                                    Color32::from_rgba_unmultiplied(
+                                                                                        accent.r(),
+                                                                                        accent.g(),
+                                                                                        accent.b(),
+                                                                                        46,
+                                                                                    )
+                                                                                } else if selected_dim {
+                                                                                    Color32::from_rgba_unmultiplied(
+                                                                                        accent.r(),
+                                                                                        accent.g(),
+                                                                                        accent.b(),
+                                                                                        22,
+                                                                                    )
+                                                                                } else {
+                                                                                    Color32::from_rgba_unmultiplied(
+                                                                                        255, 255,
+                                                                                        255, 10,
+                                                                                    )
+                                                                                },
+                                                                            );
+                                                                            p.rect_stroke(
+                                                                                rect,
+                                                                                CornerRadius::same(
+                                                                                    11,
+                                                                                ),
+                                                                                if focused {
+                                                                                    Stroke::new(
+                                                                                        1.8_f32,
+                                                                                        accent,
+                                                                                    )
+                                                                                } else if selected_dim {
+                                                                                    Stroke::new(
+                                                                                        1.1_f32,
+                                                                                        Color32::from_rgba_unmultiplied(
+                                                                                            accent.r(),
+                                                                                            accent.g(),
+                                                                                            accent.b(),
+                                                                                            100,
+                                                                                        ),
+                                                                                    )
+                                                                                } else {
+                                                                                    Stroke::new(
+                                                                                        1.0_f32,
+                                                                                        Color32::from_rgba_unmultiplied(
+                                                                                            255, 255,
+                                                                                            255, 18,
+                                                                                        ),
+                                                                                    )
+                                                                                },
+                                                                                egui::StrokeKind::Inside,
+                                                                            );
+
+                                                                            if focused {
+                                                                                p.rect_filled(
+                                                                                    Rect::from_center_size(
+                                                                                        Pos2::new(
+                                                                                            rect.left()
+                                                                                                + 6.0,
+                                                                                            rect.center()
+                                                                                                .y,
+                                                                                        ),
+                                                                                        Vec2::new(
+                                                                                            3.5,
+                                                                                            24.0,
+                                                                                        ),
+                                                                                    ),
+                                                                                    CornerRadius::same(
+                                                                                        2,
+                                                                                    ),
+                                                                                    accent,
+                                                                                );
+                                                                            }
+
+                                                                            let ic_c = Pos2::new(
+                                                                                rect.left() + 26.0,
+                                                                                rect.center().y,
+                                                                            );
+                                                                            let sc =
+                                                                                Self::setting_icon_color(
+                                                                                    row.icon_id,
+                                                                                );
+                                                                            p.circle_filled(
+                                                                                ic_c,
+                                                                                12.0,
+                                                                                if focused {
+                                                                                    Color32::from_rgba_unmultiplied(
+                                                                                        255, 255,
+                                                                                        255, 34,
+                                                                                    )
+                                                                                } else {
+                                                                                    Color32::from_rgba_unmultiplied(
+                                                                                        255, 255,
+                                                                                        255, 16,
+                                                                                    )
+                                                                                },
+                                                                            );
+                                                                            Self::draw_setting_icon(
+                                                                                p,
+                                                                                ic_c,
+                                                                                row.icon_id,
+                                                                                sc,
+                                                                            );
+
+                                                                            p.text(
+                                                                                Pos2::new(
+                                                                                    rect.left()
+                                                                                        + 48.0,
+                                                                                    rect.center().y,
+                                                                                ),
+                                                                                Align2::LEFT_CENTER,
+                                                                                row.label,
+                                                                                FontId::proportional(
+                                                                                    13.5,
+                                                                                ),
+                                                                                if focused {
+                                                                                    Color32::WHITE
+                                                                                } else {
+                                                                                    Color32::from_rgb(
+                                                                                        225, 234,
+                                                                                        248,
+                                                                                    )
+                                                                                },
+                                                                            );
+
+                                                                            match row.kind {
+                                                                                0 => {
+                                                                                    let pr = Rect::from_center_size(
+                                                                                        Pos2::new(
+                                                                                            rect.right() - 32.0,
+                                                                                            rect.center().y,
+                                                                                        ),
+                                                                                        Vec2::new(40.0, 21.0),
+                                                                                    );
+                                                                                    Self::draw_toggle_pill(
+                                                                                        ctx,
+                                                                                        p,
+                                                                                        pr,
+                                                                                        row.is_on,
+                                                                                        focused,
+                                                                                        accent,
+                                                                                        tab * 32 + idx,
+                                                                                    );
+                                                                                }
+                                                                                1 => {
+                                                                                    let pw = (row.val.len() as f32 * 7.2 + 22.0)
+                                                                                        .clamp(64.0, 148.0);
+                                                                                    let pr = Rect::from_center_size(
+                                                                                        Pos2::new(
+                                                                                            rect.right() - 12.0 - pw * 0.5,
+                                                                                            rect.center().y,
+                                                                                        ),
+                                                                                        Vec2::new(pw, 24.0),
+                                                                                    );
+                                                                                    p.rect_filled(
+                                                                                        pr,
+                                                                                        CornerRadius::same(8),
+                                                                                        if focused {
+                                                                                            Color32::from_rgba_unmultiplied(
+                                                                                                accent.r(),
+                                                                                                accent.g(),
+                                                                                                accent.b(),
+                                                                                                105,
+                                                                                            )
+                                                                                        } else {
+                                                                                            Color32::from_rgba_unmultiplied(
+                                                                                                255, 255, 255, 20,
+                                                                                            )
+                                                                                        },
+                                                                                    );
+                                                                                    p.rect_stroke(
+                                                                                        pr,
+                                                                                        CornerRadius::same(8),
+                                                                                        if focused {
+                                                                                            Stroke::new(1.2_f32, Color32::WHITE)
+                                                                                        } else {
+                                                                                            Stroke::new(
+                                                                                                1.0_f32,
+                                                                                                Color32::from_rgba_unmultiplied(
+                                                                                                    255, 255, 255, 28,
+                                                                                                ),
+                                                                                            )
+                                                                                        },
+                                                                                        egui::StrokeKind::Inside,
+                                                                                    );
+                                                                                    p.text(
+                                                                                        pr.center(),
+                                                                                        Align2::CENTER_CENTER,
+                                                                                        &row.val,
+                                                                                        FontId::proportional(11.5),
+                                                                                        Color32::WHITE,
+                                                                                    );
+                                                                                }
+                                                                                _ => {
+                                                                                    let ch_c = Pos2::new(
+                                                                                        rect.right() - 20.0,
+                                                                                        rect.center().y,
+                                                                                    );
+                                                                                    p.circle_filled(
+                                                                                        ch_c,
+                                                                                        9.5,
+                                                                                        if focused {
+                                                                                            Color32::from_rgba_unmultiplied(
+                                                                                                accent.r(),
+                                                                                                accent.g(),
+                                                                                                accent.b(),
+                                                                                                135,
+                                                                                            )
+                                                                                        } else {
+                                                                                            Color32::from_rgba_unmultiplied(
+                                                                                                accent.r(),
+                                                                                                accent.g(),
+                                                                                                accent.b(),
+                                                                                                48,
+                                                                                            )
+                                                                                        },
+                                                                                    );
+                                                                                    p.add(egui::Shape::line(
+                                                                                        vec![
+                                                                                            ch_c + Vec2::new(-2.0, -3.5),
+                                                                                            ch_c + Vec2::new(2.2, 0.0),
+                                                                                            ch_c + Vec2::new(-2.0, 3.5),
+                                                                                        ],
+                                                                                        Stroke::new(
+                                                                                            1.8_f32,
+                                                                                            if focused { Color32::WHITE } else { accent },
+                                                                                        ),
+                                                                                    ));
+                                                                                    p.text(
+                                                                                        Pos2::new(
+                                                                                            rect.right() - 37.0,
+                                                                                            rect.center().y,
+                                                                                        ),
+                                                                                        Align2::RIGHT_CENTER,
+                                                                                        &row.val,
+                                                                                        FontId::proportional(11.5),
+                                                                                        if focused {
+                                                                                            Color32::WHITE
+                                                                                        } else if row.is_on {
+                                                                                            Color32::from_rgb(110, 231, 183)
+                                                                                        } else {
+                                                                                            Color32::from_rgb(176, 192, 218)
+                                                                                        },
+                                                                                    );
+                                                                                }
+                                                                            }
+
+                                                                            if focused
+                                                                                && self
+                                                                                    .modal_focus_changed
+                                                                            {
+                                                                                resp.scroll_to_me(
+                                                                                    Some(
+                                                                                        Align::Center,
+                                                                                    ),
+                                                                                );
+                                                                                self.modal_focus_changed =
+                                                                                    false;
+                                                                            }
+                                                                            if resp.clicked() {
+                                                                                self.settings_zone =
+                                                                                    SettingsZone::List;
+                                                                                self.modal_focus =
+                                                                                    idx;
+                                                                                activate_list =
+                                                                                    Some((
+                                                                                        tab, idx,
+                                                                                    ));
+                                                                            }
+                                                                            ui.add_space(5.0);
+                                                                        }
+                                                                    });
+                                                            },
+                                                        );
+                                                    });
+                                            },
+                                        );
+
+                                        // RIGHT 40%: Live Preview & Quick Tools Stage (explicit top-down!)
+                                        let right_fill = Color32::from_rgba_unmultiplied(
+                                            fill.r().saturating_sub(4),
+                                            fill.g().saturating_sub(4),
+                                            fill.b().saturating_sub(2),
+                                            fill.a().saturating_add(16),
+                                        );
+                                        ui.allocate_ui_with_layout(
+                                            Vec2::new(right_w, body_h),
+                                            egui::Layout::top_down(Align::LEFT),
+                                            |ui| {
+                                                egui::Frame::NONE
+                                                    .fill(right_fill)
+                                                    .stroke(Stroke::new(
+                                                        1.2_f32,
+                                                        Color32::from_rgba_unmultiplied(
+                                                            255, 255, 255, 42,
+                                                        ),
+                                                    ))
+                                                    .corner_radius(CornerRadius::same(18))
+                                                    .inner_margin(egui::Margin::same(14))
+                                                    .show(ui, |ui| {
+                                                        let inner_w = right_w - 28.0;
+                                                        let inner_h = body_h - 28.0;
+                                                        ui.set_min_size(Vec2::new(
+                                                            inner_w, inner_h,
+                                                        ));
+                                                        ui.allocate_ui_with_layout(
+                                                            Vec2::new(inner_w, inner_h),
+                                                            egui::Layout::top_down(Align::LEFT),
+                                                            |ui| {
+                                                                ui.set_min_height(inner_h);
+                                                                ui.spacing_mut().item_spacing =
+                                                                    Vec2::new(6.0, 0.0);
+
+                                                                let cur = &rows[self
+                                                                    .modal_focus
+                                                                    .min(rows.len() - 1)];
+
+                                                                // Header bar: LIVE PREVIEW + contextual hint
+                                                                ui.horizontal(|ui| {
+                                                                    ui.label(
+                                                                        RichText::new(
+                                                                            "LIVE PREVIEW",
+                                                                        )
+                                                                        .font(FontId::proportional(
+                                                                            10.5,
+                                                                        ))
+                                                                        .strong()
+                                                                        .color(accent),
+                                                                    );
+                                                                    ui.with_layout(
+                                                                        egui::Layout::right_to_left(
+                                                                            Align::Center,
+                                                                        ),
+                                                                        |ui| {
+                                                                            let hint = match cur.kind
+                                                                            {
+                                                                                0 => "OK Toggle",
+                                                                                1 => "OK Cycle",
+                                                                                _ => "OK Open",
+                                                                            };
+                                                                            ui.label(
+                                                                                RichText::new(hint)
+                                                                                    .font(
+                                                                                        FontId::proportional(
+                                                                                            10.0,
+                                                                                        ),
+                                                                                    )
+                                                                                    .color(
+                                                                                        Color32::from_rgb(
+                                                                                            162,
+                                                                                            180,
+                                                                                            208,
+                                                                                        ),
+                                                                                    ),
+                                                                            );
+                                                                        },
+                                                                    );
+                                                                });
+                                                                ui.add_space(6.0);
+
+                                                                // Dynamic Clipped Vector Preview Canvas
+                                                                let (preview_rect, _) = ui
+                                                                    .allocate_exact_size(
+                                                                        Vec2::new(inner_w, 162.0),
+                                                                        Sense::hover(),
+                                                                    );
+                                                                let clip_p =
+                                                                    ui.painter_at(preview_rect);
+                                                                self.draw_settings_live_preview(
+                                                                    ctx,
+                                                                    &clip_p,
+                                                                    preview_rect,
+                                                                    tab,
+                                                                    self.modal_focus,
+                                                                    visible.len(),
+                                                                );
+
+                                                                ui.add_space(10.0);
+
+                                                                // Context Info for Focused Item (expands cleanly so Quick Tools align flush with bottom of left card)
+                                                                let info_h = (inner_h - 286.0)
+                                                                    .max(66.0);
+                                                                ui.allocate_ui_with_layout(
+                                                                    Vec2::new(inner_w, info_h),
+                                                                    egui::Layout::top_down(
+                                                                        Align::LEFT,
+                                                                    ),
+                                                                    |ui| {
+                                                                        ui.set_min_height(info_h);
+                                                                        ui.horizontal(|ui| {
+                                                                            let (ir, _) = ui
+                                                                                .allocate_exact_size(
+                                                                                    Vec2::splat(
+                                                                                        22.0,
+                                                                                    ),
+                                                                                    Sense::hover(),
+                                                                                );
+                                                                            let sc = Self::setting_icon_color(
+                                                                                cur.icon_id,
+                                                                            );
+                                                                            ui.painter()
+                                                                                .circle_filled(
+                                                                                    ir.center(),
+                                                                                    11.0,
+                                                                                    Color32::from_rgba_unmultiplied(
+                                                                                        sc.r(),
+                                                                                        sc.g(),
+                                                                                        sc.b(),
+                                                                                        36,
+                                                                                    ),
+                                                                                );
+                                                                            Self::draw_setting_icon(
+                                                                                ui.painter(),
+                                                                                ir.center(),
+                                                                                cur.icon_id,
+                                                                                sc,
+                                                                            );
+                                                                            ui.label(
+                                                                                RichText::new(
+                                                                                    cur.label,
+                                                                                )
+                                                                                .font(
+                                                                                    FontId::proportional(
+                                                                                        14.5,
+                                                                                    ),
+                                                                                )
+                                                                                .strong()
+                                                                                .color(
+                                                                                    Color32::WHITE,
+                                                                                ),
+                                                                            );
+                                                                        });
+                                                                        ui.add_space(4.0);
+                                                                        ui.label(
+                                                                            RichText::new(cur.desc)
+                                                                                .font(
+                                                                                    FontId::proportional(
+                                                                                        11.5,
+                                                                                    ),
+                                                                                )
+                                                                                .color(
+                                                                                    Color32::from_rgb(
+                                                                                        188, 204,
+                                                                                        228,
+                                                                                    ),
+                                                                                ),
+                                                                        );
+                                                                    },
+                                                                );
+
+                                                                // Bottom Pinned Android TV Shortcuts & Boost RAM QuickBar
+                                                                let (sep_r, _) = ui
+                                                                    .allocate_exact_size(
+                                                                        Vec2::new(inner_w, 1.0),
+                                                                        Sense::hover(),
+                                                                    );
+                                                                ui.painter().rect_filled(
+                                                                    sep_r,
+                                                                    CornerRadius::ZERO,
+                                                                    Color32::from_rgba_unmultiplied(
+                                                                        255, 255, 255, 24,
+                                                                    ),
+                                                                );
+                                                                ui.add_space(6.0);
+                                                                ui.label(
+                                                                    RichText::new(
+                                                                        "ANDROID TV & QUICK TOOLS",
+                                                                    )
+                                                                    .font(FontId::proportional(9.5))
+                                                                    .strong()
+                                                                    .color(Color32::from_rgb(
+                                                                        148, 166, 196,
+                                                                    )),
+                                                                );
+                                                                ui.add_space(5.0);
+
+                                                                let shortcuts = [
+                                                                    ("Network", 200usize),
+                                                                    ("Apps", 201usize),
+                                                                    ("Display", 202usize),
+                                                                    ("System", 204usize),
+                                                                ];
+                                                                let btn_gap = 6.0_f32;
+                                                                let btn_w =
+                                                                    (inner_w - btn_gap * 3.0) / 4.0;
+                                                                ui.horizontal(|ui| {
+                                                                    ui.spacing_mut()
+                                                                        .item_spacing
+                                                                        .x = btn_gap;
+                                                                    for (c, (lbl, ic)) in
+                                                                        shortcuts.iter().enumerate()
+                                                                    {
+                                                                        let f = self.settings_zone
+                                                                            == SettingsZone::QuickBar
+                                                                            && self
+                                                                                .settings_sys_col
+                                                                                == c;
+                                                                        let (br, bresp) = ui
+                                                                            .allocate_exact_size(
+                                                                                Vec2::new(
+                                                                                    btn_w, 29.0,
+                                                                                ),
+                                                                                Sense::click(),
+                                                                            );
+                                                                        let bp = ui.painter();
+                                                                        bp.rect_filled(
+                                                                            br,
+                                                                            CornerRadius::same(8),
+                                                                            if f {
+                                                                                Color32::from_rgba_unmultiplied(
+                                                                                    accent.r(),
+                                                                                    accent.g(),
+                                                                                    accent.b(),
+                                                                                    98,
+                                                                                )
+                                                                            } else {
+                                                                                Color32::from_rgba_unmultiplied(
+                                                                                    255, 255, 255,
+                                                                                    15,
+                                                                                )
+                                                                            },
+                                                                        );
+                                                                        bp.rect_stroke(
+                                                                            br,
+                                                                            CornerRadius::same(8),
+                                                                            if f {
+                                                                                Stroke::new(
+                                                                                    1.8_f32,
+                                                                                    Color32::WHITE,
+                                                                                )
+                                                                            } else {
+                                                                                Stroke::new(
+                                                                                    1.0_f32,
+                                                                                    Color32::from_rgba_unmultiplied(
+                                                                                        255, 255,
+                                                                                        255, 24,
+                                                                                    ),
+                                                                                )
+                                                                            },
+                                                                            egui::StrokeKind::Inside,
+                                                                        );
+                                                                        Self::draw_setting_icon(
+                                                                            bp,
+                                                                            Pos2::new(
+                                                                                br.left() + 14.0,
+                                                                                br.center().y,
+                                                                            ),
+                                                                            *ic,
+                                                                            Color32::WHITE,
+                                                                        );
+                                                                        bp.text(
+                                                                            Pos2::new(
+                                                                                br.left() + 26.0,
+                                                                                br.center().y,
+                                                                            ),
+                                                                            Align2::LEFT_CENTER,
+                                                                            *lbl,
+                                                                            FontId::proportional(
+                                                                                10.5,
+                                                                            ),
+                                                                            Color32::WHITE,
+                                                                        );
+                                                                        if bresp.clicked() {
+                                                                            self.settings_zone =
+                                                                                SettingsZone::QuickBar;
+                                                                            self.settings_sys_col =
+                                                                                c;
+                                                                            activate_quick =
+                                                                                Some(c);
+                                                                        }
+                                                                    }
+                                                                });
+
+                                                                ui.add_space(6.0);
+
+                                                                // Full-width Boost RAM Pill (QuickBar index 4)
+                                                                let boost_f = self.settings_zone
+                                                                    == SettingsZone::QuickBar
+                                                                    && self.settings_sys_col == 4;
+                                                                let (rr, rresp) = ui
+                                                                    .allocate_exact_size(
+                                                                        Vec2::new(inner_w, 30.0),
+                                                                        Sense::click(),
+                                                                    );
+                                                                let rp = ui.painter();
+                                                                rp.rect_filled(
+                                                                    rr,
+                                                                    CornerRadius::same(9),
+                                                                    if boost_f {
+                                                                        Color32::from_rgba_unmultiplied(
+                                                                            accent.r(),
+                                                                            accent.g(),
+                                                                            accent.b(),
+                                                                            110,
+                                                                        )
+                                                                    } else {
+                                                                        Color32::from_rgba_unmultiplied(
+                                                                            accent.r(),
+                                                                            accent.g(),
+                                                                            accent.b(),
+                                                                            32,
+                                                                        )
+                                                                    },
+                                                                );
+                                                                rp.rect_stroke(
+                                                                    rr,
+                                                                    CornerRadius::same(9),
+                                                                    if boost_f {
+                                                                        Stroke::new(
+                                                                            1.8_f32,
+                                                                            Color32::WHITE,
+                                                                        )
+                                                                    } else {
+                                                                        Stroke::new(
+                                                                            1.0_f32,
+                                                                            Color32::from_rgba_unmultiplied(
+                                                                                accent.r(),
+                                                                                accent.g(),
+                                                                                accent.b(),
+                                                                                110,
+                                                                            ),
+                                                                        )
+                                                                    },
+                                                                    egui::StrokeKind::Inside,
+                                                                );
+                                                                Self::draw_setting_icon(
+                                                                    rp,
+                                                                    Pos2::new(
+                                                                        rr.left() + 18.0,
+                                                                        rr.center().y,
+                                                                    ),
+                                                                    101,
+                                                                    Color32::WHITE,
+                                                                );
+                                                                rp.text(
+                                                                    Pos2::new(
+                                                                        rr.left() + 34.0,
+                                                                        rr.center().y,
+                                                                    ),
+                                                                    Align2::LEFT_CENTER,
+                                                                    format!(
+                                                                        "Boost RAM  ·  {} / {} MB free",
+                                                                        self.status.ram_free_mb,
+                                                                        self.status.ram_total_mb
+                                                                    ),
+                                                                    FontId::proportional(11.5),
+                                                                    Color32::WHITE,
+                                                                );
+                                                                if rresp.clicked() {
+                                                                    self.settings_zone =
+                                                                        SettingsZone::QuickBar;
+                                                                    self.settings_sys_col = 4;
+                                                                    activate_quick = Some(4);
+                                                                }
+                                                            },
+                                                        );
+                                                    });
+                                            },
+                                        );
+                                    },
+                                );
+                            },
                         );
-                        ui.add_space(4.0);
-                        let sys_row = this.modal_focus == SYS_IDX;
-                        let items = [
-                            ("Network", "network"),
-                            ("Apps", "apps"),
-                            ("Display & Sound", "display"),
-                            ("System Settings", "main"),
-                        ];
-                        ui.columns(4, |cols| {
-                            for (c, (lbl, sec)) in items.iter().enumerate() {
-                                let w = cols[c].available_width();
-                                let f = sys_row && this.settings_sys_col == c;
-                                let (rect, resp) = cols[c].allocate_exact_size(Vec2::new(w, 36.0), Sense::click());
-                                let p = cols[c].painter();
-                                p.rect_filled(
-                                    rect,
-                                    CornerRadius::same(10),
-                                    if f {
-                                        Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 85)
-                                    } else {
-                                        Color32::from_rgba_unmultiplied(255, 255, 255, 16)
-                                    },
-                                );
-                                p.rect_stroke(
-                                    rect,
-                                    CornerRadius::same(10),
-                                    if f {
-                                        Stroke::new(1.8_f32, accent)
-                                    } else {
-                                        Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(255, 255, 255, 28))
-                                    },
-                                    egui::StrokeKind::Inside,
-                                );
-                                let ic_center = Pos2::new(rect.left() + 20.0, rect.center().y);
-                                Self::draw_setting_icon(p, ic_center, 200 + c, Color32::WHITE);
-                                p.text(
-                                    Pos2::new(rect.left() + 34.0, rect.center().y),
-                                    Align2::LEFT_CENTER,
-                                    *lbl,
-                                    FontId::proportional(12.0),
-                                    Color32::WHITE,
-                                );
-                                if f && this.modal_focus_changed {
-                                    resp.scroll_to_me(Some(Align::Center));
-                                    this.modal_focus_changed = false;
-                                }
-                                if resp.clicked() {
-                                    this.modal_focus = SYS_IDX;
-                                    this.settings_sys_col = c;
-                                    bridge::open_system_settings(sec);
-                                }
+                    });
+
+                // Apply mouse tab / close clicks
+                if clicked_close {
+                    self.close_modal_step();
+                    return;
+                }
+                if let Some(t_idx) = clicked_tab {
+                    self.settings_tab = t_idx;
+                    self.settings_ribbon_focus = t_idx;
+                    self.settings_zone = SettingsZone::List;
+                    self.modal_focus = 0;
+                    self.modal_focus_changed = true;
+                }
+
+                // Execute QuickBar action
+                if let Some(q_idx) = activate_quick {
+                    match q_idx {
+                        0 => bridge::open_system_settings("network"),
+                        1 => bridge::open_system_settings("apps"),
+                        2 => bridge::open_system_settings("display"),
+                        3 => bridge::open_system_settings("main"),
+                        _ => self.spawn_clear_ram(ctx.clone()),
+                    }
+                }
+
+                // Execute Selected Setting Action
+                if let Some((t_idx, r_idx)) = activate_list {
+                    match (t_idx, r_idx) {
+                        // Tab 0: Appearance
+                        (0, 0) => self.open_modal(ActiveModal::Theme),
+                        (0, 1) => {
+                            self.config.layout_style = match self.config.layout_style {
+                                LayoutStyle::Zenith => LayoutStyle::Classic,
+                                LayoutStyle::Classic => LayoutStyle::Zenith,
+                            };
+                            self.save_config();
+                            self.show_toast(format!(
+                                "Switched to {}",
+                                self.config.layout_style.label()
+                            ));
+                        }
+                        (0, 2) => {
+                            self.config.screensaver_style = self.config.screensaver_style.next();
+                            self.save_config();
+                            self.show_toast(format!(
+                                "Screensaver Style: {}",
+                                self.config.screensaver_style.label()
+                            ));
+                        }
+                        (0, 3) => {
+                            self.config.ambient_timeout_secs =
+                                match self.config.ambient_timeout_secs {
+                                    0 => 60,
+                                    60 => 180,
+                                    180 => 300,
+                                    _ => 0,
+                                };
+                            self.save_config();
+                        }
+                        (0, 4) => {
+                            self.config.icon_size = match self.config.icon_size {
+                                IconSize::Compact => IconSize::Standard,
+                                IconSize::Standard => IconSize::Large,
+                                IconSize::Large => IconSize::Compact,
+                            };
+                            self.save_config();
+                        }
+                        (0, 5) => {
+                            self.config.show_header = !self.config.show_header;
+                            self.save_config();
+                        }
+                        (0, 6) => {
+                            self.config.show_labels = !self.config.show_labels;
+                            self.save_config();
+                        }
+                        (0, 7) => {
+                            self.config.auto_night_dim = !self.config.auto_night_dim;
+                            self.save_config();
+                        }
+                        (0, 8) => {
+                            self.config.lightweight_mode = !self.config.lightweight_mode;
+                            let tol = if self.config.lightweight_mode { 0.6 } else { 0.2 };
+                            ctx.options_mut(|o| {
+                                o.tessellation_options.bezier_tolerance = tol;
+                            });
+                            self.wallpaper_tex = None;
+                            self.wallpaper_loading = None;
+                            self.save_config();
+                            self.ensure_wallpaper(ctx.clone());
+                            self.show_toast(if self.config.lightweight_mode {
+                                "Lightweight Mode ON (low CPU/VRAM)"
+                            } else {
+                                "Full 4K Quality Mode ON"
+                            });
+                        }
+                        // Tab 1: Weather & HUD
+                        (1, 0) => {
+                            self.config.show_weather = !self.config.show_weather;
+                            self.save_config();
+                        }
+                        (1, 1) => self.open_modal(ActiveModal::WeatherCity),
+                        (1, 2) => {
+                            self.config.clock_24h = !self.config.clock_24h;
+                            self.cached_sec = u32::MAX;
+                            self.save_config();
+                        }
+                        (1, 3) => {
+                            self.config.show_status_pill = !self.config.show_status_pill;
+                            self.save_config();
+                        }
+                        (1, 4) => {
+                            self.config.show_now_playing = !self.config.show_now_playing;
+                            self.save_config();
+                        }
+                        (1, 5) => self.open_modal(ActiveModal::Overlay),
+                        // Tab 2: Gemini AI
+                        (2, 0) => {
+                            self.config.gemini_enabled = !self.config.gemini_enabled;
+                            if !self.config.gemini_enabled {
+                                self.gemini_reply.clear();
+                                self.gemini_last_id = None;
                             }
-                        });
-                    },
-                );
+                            self.save_config();
+                            self.show_toast(if self.config.gemini_enabled {
+                                "Gemini AI ON"
+                            } else {
+                                "Gemini AI OFF"
+                            });
+                        }
+                        (2, 1) => {
+                            self.config.gemini_model =
+                                gemini::next_model(&self.config.gemini_model).to_string();
+                            self.gemini_last_id = None;
+                            self.save_config();
+                            self.show_toast(format!("Gemini Model: {}", self.config.gemini_model));
+                        }
+                        (2, 2) => {
+                            self.gemini_text_mode = false;
+                            self.open_modal(ActiveModal::Gemini);
+                            if !self.config.gemini_api_key.trim().is_empty() && !self.gemini_busy {
+                                self.start_gemini_voice_listen();
+                            }
+                        }
+                        (2, 3) => self.open_modal(ActiveModal::GeminiSettings),
+                        (2, 4) => {
+                            let p = "Recommend 3 great movies or shows to watch tonight with a quick spoken pitch for each.".to_string();
+                            self.gemini_prompt = p.clone();
+                            self.gemini_text_mode = false;
+                            self.open_modal(ActiveModal::Gemini);
+                            self.spawn_ask_gemini(ctx.clone(), p);
+                        }
+                        (2, 5) => {
+                            self.a2ui.clear_custom();
+                            self.gemini_reply.clear();
+                            self.gemini_last_id = None;
+                            self.a2ui_feedback =
+                                "Cleared Gemini chat & custom surfaces".to_string();
+                            self.show_toast("Cleared Gemini chat & custom surfaces");
+                        }
+                        // Tab 3: Apps
+                        (3, 0) => {
+                            self.config.sort_order = match self.config.sort_order {
+                                SortOrder::Alpha => SortOrder::Recent,
+                                SortOrder::Recent => SortOrder::Alpha,
+                            };
+                            self.save_config();
+                        }
+                        (3, 1) => {
+                            self.active_folder_idx = None;
+                            self.open_modal(ActiveModal::Folders);
+                        }
+                        (3, 2) => {
+                            self.config.show_mobile_apps = !self.config.show_mobile_apps;
+                            self.save_config();
+                        }
+                        (3, 3) => {
+                            self.config.show_system_apps = !self.config.show_system_apps;
+                            self.save_config();
+                        }
+                        (3, 4) => {
+                            self.config.auto_clear_ram_on_home =
+                                !self.config.auto_clear_ram_on_home;
+                            self.save_config();
+                        }
+                        (3, 5) => {
+                            self.config.hidden_apps.clear();
+                            self.save_config();
+                            self.show_toast("Restored all hidden apps");
+                        }
+                        // Tab 4: System
+                        (4, 0) => self.open_modal(ActiveModal::StartupOptions),
+                        (4, 1) => {
+                            let ok = bridge::open_home_settings();
+                            if !ok {
+                                self.show_toast("Open Android Settings → Apps → Default Home");
+                            }
+                        }
+                        (4, 2) => self.open_modal(ActiveModal::PowerMenu),
+                        (4, 3) => {
+                            self.local_ip = bridge::get_local_ip();
+                            self.open_modal(ActiveModal::PhoneCompanion);
+                        }
+                        (4, 4) => self.open_modal(ActiveModal::Backup),
+                        (4, 5) => {
+                            self.open_modal(ActiveModal::Updater);
+                            if matches!(
+                                self.updater_state,
+                                UpdaterState::Idle | UpdaterState::Error(_)
+                            ) {
+                                self.spawn_check_update(ctx.clone(), false);
+                            }
+                        }
+                        (4, 6) => self.open_modal(ActiveModal::Donate),
+                        _ => {}
+                    }
+                }
             }
 
             ActiveModal::Search => {
@@ -5040,6 +7172,360 @@ impl AstryxTvApp {
                         ui.add_space(5.0);
                     }
                 });
+            }
+
+            ActiveModal::Gemini => {
+                // Pure floating Voice Orb overlay — handle BACK / Escape / Backspace directly
+                // since this overlay intentionally renders without draw_modal_shell().
+                let jni_back = bridge::take_back_pressed();
+                let key_back = ctx.input(|i| i.key_pressed(Key::Escape) || i.key_pressed(Key::Backspace));
+                if (jni_back || key_back) && self.last_back_handled.elapsed() > Duration::from_millis(260) {
+                    self.last_back_handled = Instant::now();
+                    self.close_modal_step();
+                    return;
+                }
+
+                // Hands-free silence VAD auto-submits when user pauses speaking.
+                if self.gemini_listening && bridge::is_voice_auto_stopped() {
+                    self.finish_gemini_voice_listen(ctx.clone());
+                } else if self.gemini_listening && !bridge::is_voice_recording() {
+                    self.gemini_listening = false;
+                }
+
+                let is_speaking = bridge::is_speaking();
+                let audio_level = if self.gemini_listening {
+                    bridge::get_voice_level()
+                } else if is_speaking {
+                    bridge::get_speak_level()
+                } else {
+                    0.0
+                };
+
+                let mut toggle_voice = false;
+                if allow_keys {
+                    ctx.input(|i| {
+                        if i.key_pressed(Key::Enter) || i.key_pressed(Key::Space) {
+                            toggle_voice = true;
+                        }
+                    });
+                }
+
+                let screen = ctx.screen_rect();
+                let accent = self.config.accent();
+                let listening_now = self.gemini_listening;
+                let busy_now = self.gemini_busy;
+                let has_key = !self.config.gemini_api_key.trim().is_empty();
+
+                // Soft full-screen vignette scrim behind the floating orb
+                egui::Area::new(egui::Id::new("gemini_orb_scrim"))
+                    .fixed_pos(screen.min)
+                    .order(egui::Order::Middle)
+                    .show(ctx, |ui| {
+                        let (r, resp) = ui.allocate_exact_size(screen.size(), Sense::click());
+                        ui.painter().rect_filled(
+                            r,
+                            CornerRadius::ZERO,
+                            Color32::from_rgba_unmultiplied(4, 7, 16, 178),
+                        );
+                        if resp.clicked() {
+                            self.close_modal_step();
+                        }
+                    });
+
+                // Floating centered Voice Orb ONLY + minimal caption/subtitle
+                egui::Area::new(egui::Id::new("gemini_orb_overlay"))
+                    .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                    .order(egui::Order::Foreground)
+                    .show(ctx, |ui| {
+                        ui.set_width(580.0);
+                        ui.vertical_centered(|ui| {
+                            let orb_resp = self.draw_gemini_voice_orb(
+                                ui,
+                                ctx,
+                                listening_now,
+                                busy_now,
+                                is_speaking,
+                                audio_level,
+                            );
+                            if orb_resp.clicked() {
+                                toggle_voice = true;
+                            }
+
+                            ui.add_space(6.0);
+                            let caption = if !has_key {
+                                "Set Gemini API key in Settings → Gemini AI"
+                            } else if listening_now {
+                                "Listening..."
+                            } else if busy_now {
+                                "Thinking..."
+                            } else if is_speaking {
+                                "Speaking..."
+                            } else {
+                                "Press OK to Speak"
+                            };
+                            ui.label(
+                                RichText::new(caption)
+                                    .font(FontId::proportional(17.0))
+                                    .strong()
+                                    .color(if listening_now {
+                                        Color32::from_rgb(52, 211, 153)
+                                    } else if !has_key {
+                                        Color32::from_rgb(251, 191, 36)
+                                    } else {
+                                        accent
+                                    }),
+                            );
+
+                            if !self.gemini_reply.is_empty() {
+                                ui.add_space(12.0);
+                                ui.label(
+                                    RichText::new(&self.gemini_reply)
+                                        .font(FontId::proportional(16.0))
+                                        .color(Color32::from_rgba_unmultiplied(240, 246, 255, 235)),
+                                );
+                            } else if !self.a2ui_feedback.is_empty()
+                                && self.a2ui_feedback.starts_with("Gemini error:")
+                            {
+                                ui.add_space(8.0);
+                                ui.label(
+                                    RichText::new(&self.a2ui_feedback)
+                                        .font(FontId::proportional(13.5))
+                                        .color(Color32::from_rgb(248, 113, 113)),
+                                );
+                            }
+                        });
+                    });
+
+                if toggle_voice {
+                    if !has_key {
+                        self.open_modal(ActiveModal::GeminiSettings);
+                    } else if self.gemini_listening {
+                        self.finish_gemini_voice_listen(ctx.clone());
+                    } else if is_speaking {
+                        bridge::stop_speaking();
+                        self.start_gemini_voice_listen();
+                    } else if !self.gemini_busy {
+                        self.start_gemini_voice_listen();
+                    }
+                }
+            }
+
+            ActiveModal::GeminiSettings => {
+                const ITEM_COUNT: usize = 7;
+                let mut trigger = false;
+                if allow_keys {
+                    ctx.input(|i| {
+                        if i.key_pressed(Key::ArrowDown) {
+                            self.modal_focus = (self.modal_focus + 1).min(ITEM_COUNT - 1);
+                            self.modal_focus_changed = true;
+                        } else if i.key_pressed(Key::ArrowUp) {
+                            if self.modal_focus == 0 {
+                                self.modal_close_focused = true;
+                            } else {
+                                self.modal_focus -= 1;
+                                self.modal_focus_changed = true;
+                            }
+                        } else if i.key_pressed(Key::Enter) || i.key_pressed(Key::Space) {
+                            trigger = true;
+                        }
+                    });
+                }
+
+                let mut chosen: Option<usize> = if trigger {
+                    Some(self.modal_focus)
+                } else {
+                    None
+                };
+
+                let has_key = !self.config.gemini_api_key.trim().is_empty();
+                let companion_url = format!("http://{}:{WEB_COMPANION_PORT}", self.local_ip);
+
+                self.draw_modal_shell(
+                    ctx,
+                    "Gemini AI Settings  (Up/Down move · OK select)",
+                    760.0,
+                    470.0,
+                    |this, ui, _ctx| {
+                        let accent = this.config.accent();
+                        let rows: [(&str, String, bool); ITEM_COUNT] = [
+                            (
+                                "Gemini AI & Top-Bar Icon",
+                                if this.config.gemini_enabled { "ON" } else { "OFF" }.to_string(),
+                                this.config.gemini_enabled,
+                            ),
+                            (
+                                "Gemini Model",
+                                this.config.gemini_model.clone(),
+                                true,
+                            ),
+                            (
+                                "API Key (via Phone Companion)",
+                                if has_key {
+                                    "✓ Configured ›".to_string()
+                                } else {
+                                    format!("Set at {companion_url} ›")
+                                },
+                                has_key,
+                            ),
+                            (
+                                "Send Text Prompt",
+                                if this.gemini_busy { "Thinking..." } else { "Send" }.to_string(),
+                                false,
+                            ),
+                            (
+                                "Quick Voice: What to Watch",
+                                "Run".to_string(),
+                                false,
+                            ),
+                            (
+                                "Quick Voice: Evening Briefing",
+                                "Run".to_string(),
+                                false,
+                            ),
+                            (
+                                "Clear Chat & A2UI Surfaces",
+                                "Reset".to_string(),
+                                false,
+                            ),
+                        ];
+
+                        for (idx, (label, val, is_on)) in rows.iter().enumerate() {
+                            let focused = this.modal_focus == idx;
+                            egui::Frame::NONE
+                                .fill(if focused {
+                                    Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 38)
+                                } else {
+                                    Color32::from_rgba_unmultiplied(255, 255, 255, 10)
+                                })
+                                .stroke(if focused {
+                                    Stroke::new(1.8_f32, accent)
+                                } else {
+                                    Stroke::new(
+                                        1.0_f32,
+                                        Color32::from_rgba_unmultiplied(255, 255, 255, 20),
+                                    )
+                                })
+                                .corner_radius(CornerRadius::same(11))
+                                .inner_margin(egui::Margin::symmetric(14, 9))
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            RichText::new(*label)
+                                                .font(FontId::proportional(14.0))
+                                                .strong()
+                                                .color(Color32::WHITE),
+                                        );
+                                        ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                                            let pill_fill = if focused {
+                                                accent
+                                            } else if *is_on {
+                                                Color32::from_rgba_unmultiplied(52, 211, 153, 38)
+                                            } else {
+                                                Color32::from_rgba_unmultiplied(255, 255, 255, 16)
+                                            };
+                                            if ui
+                                                .add(
+                                                    egui::Button::new(
+                                                        RichText::new(val)
+                                                            .font(FontId::proportional(12.5))
+                                                            .strong()
+                                                            .color(Color32::WHITE),
+                                                    )
+                                                    .fill(pill_fill)
+                                                    .corner_radius(CornerRadius::same(8)),
+                                                )
+                                                .clicked()
+                                            {
+                                                this.modal_focus = idx;
+                                                chosen = Some(idx);
+                                            }
+                                        });
+                                    });
+                                });
+                            ui.add_space(5.0);
+                        }
+
+                        ui.add_space(4.0);
+                        ui.label(
+                            RichText::new("TEXT PROMPT")
+                                .font(FontId::proportional(10.5))
+                                .strong()
+                                .color(Color32::from_rgb(160, 178, 204)),
+                        );
+                        ui.add(
+                            egui::TextEdit::singleline(&mut this.gemini_prompt)
+                                .desired_width(f32::INFINITY)
+                                .hint_text("Type a prompt for Send Text Prompt above..."),
+                        );
+                        if !this.a2ui_feedback.is_empty() {
+                            ui.add_space(4.0);
+                            ui.label(
+                                RichText::new(&this.a2ui_feedback)
+                                    .font(FontId::proportional(12.5))
+                                    .color(accent)
+                                    .strong(),
+                            );
+                        }
+                    },
+                );
+
+                if let Some(act) = chosen {
+                    match act {
+                        0 => {
+                            self.config.gemini_enabled = !self.config.gemini_enabled;
+                            if !self.config.gemini_enabled {
+                                self.gemini_reply.clear();
+                                self.gemini_last_id = None;
+                            }
+                            self.save_config();
+                            self.show_toast(if self.config.gemini_enabled {
+                                "Gemini AI ON"
+                            } else {
+                                "Gemini AI OFF"
+                            });
+                        }
+                        1 => {
+                            self.config.gemini_model =
+                                gemini::next_model(&self.config.gemini_model).to_string();
+                            self.gemini_last_id = None;
+                            self.save_config();
+                            self.show_toast(format!("Gemini Model: {}", self.config.gemini_model));
+                        }
+                        2 => {
+                            self.local_ip = bridge::get_local_ip();
+                            self.open_modal(ActiveModal::PhoneCompanion);
+                        }
+                        3 => {
+                            let p = self.gemini_prompt.trim().to_string();
+                            if !p.is_empty() {
+                                self.gemini_text_mode = false;
+                                self.open_modal(ActiveModal::Gemini);
+                                self.spawn_ask_gemini(ctx.clone(), p);
+                            }
+                        }
+                        4 => {
+                            let p = "Recommend 3 great movies or shows to watch tonight with a quick spoken pitch for each.".to_string();
+                            self.gemini_prompt = p.clone();
+                            self.gemini_text_mode = false;
+                            self.open_modal(ActiveModal::Gemini);
+                            self.spawn_ask_gemini(ctx.clone(), p);
+                        }
+                        5 => {
+                            let p = "Give me a warm, concise evening TV briefing based on my current time, city, and weather.".to_string();
+                            self.gemini_prompt = p.clone();
+                            self.gemini_text_mode = false;
+                            self.open_modal(ActiveModal::Gemini);
+                            self.spawn_ask_gemini(ctx.clone(), p);
+                        }
+                        _ => {
+                            self.a2ui.clear_custom();
+                            self.gemini_reply.clear();
+                            self.gemini_last_id = None;
+                            self.a2ui_feedback = "Cleared Gemini chat & custom surfaces".to_string();
+                            self.show_toast("Cleared Gemini chat & custom surfaces");
+                        }
+                    }
+                }
             }
 
             ActiveModal::A2ui => {
@@ -7269,16 +9755,14 @@ impl AstryxTvApp {
 
                                 ui.separator();
 
-                                // 7 crisp vector quick-action icons
+                                // Crisp vector quick-action icons (includes Gemini AI sparkle when enabled)
                                 ui.spacing_mut().item_spacing.x = 6.0;
-                                let labels = [
-                                    "Wi-Fi", "VPN", "Search", "Theme", "A2UI", "Refresh", "Settings",
-                                ];
-                                for (idx, tip) in labels.iter().enumerate() {
+                                let items = self.dock_items();
+                                for (pos, (action_id, tip)) in items.iter().copied().enumerate() {
                                     let focused = self.modal == ActiveModal::None
-                                        && self.focus == FocusTarget::Dock(idx);
+                                        && self.focus == FocusTarget::Dock(pos);
                                     let anim = ctx.animate_bool_with_time(
-                                        egui::Id::new(("zenith_dock_focus", idx)),
+                                        egui::Id::new(("zenith_dock_focus", action_id)),
                                         focused,
                                         0.12,
                                     );
@@ -7309,7 +9793,7 @@ impl AstryxTvApp {
                                             Color32::from_rgba_unmultiplied(255, 255, 255, 16),
                                         );
                                     }
-                                    let icon_color = if idx == 1 {
+                                    let icon_color = if action_id == 1 {
                                         if self.status.is_vpn_active {
                                             if focused {
                                                 Color32::from_rgb(74, 222, 128)
@@ -7321,13 +9805,15 @@ impl AstryxTvApp {
                                         } else {
                                             Color32::from_rgb(248, 113, 113)
                                         }
+                                    } else if action_id == 7 && !focused {
+                                        accent
                                     } else if focused {
                                         Color32::WHITE
                                     } else {
                                         Color32::from_rgb(225, 232, 245)
                                     };
-                                    Self::draw_dock_icon(p, rect.center(), idx, icon_color);
-                                    if idx == 0 {
+                                    Self::draw_dock_icon(p, rect.center(), action_id, icon_color);
+                                    if action_id == 0 {
                                         let dot_c = if self.status.is_connected {
                                             Color32::from_rgb(52, 211, 153)
                                         } else {
@@ -7338,7 +9824,7 @@ impl AstryxTvApp {
                                             3.0,
                                             dot_c,
                                         );
-                                    } else if idx == 1 {
+                                    } else if action_id == 1 {
                                         let dot_c = if self.status.is_vpn_active {
                                             Color32::from_rgb(52, 211, 153)
                                         } else {
@@ -7349,7 +9835,7 @@ impl AstryxTvApp {
                                             3.0,
                                             dot_c,
                                         );
-                                    } else if idx == 6 && self.has_update_available() {
+                                    } else if action_id == 6 && self.has_update_available() {
                                         p.circle_filled(
                                             rect.right_top() + Vec2::new(-4.0, 4.0),
                                             3.6,
@@ -7357,24 +9843,10 @@ impl AstryxTvApp {
                                         );
                                     }
                                     if resp.clicked() {
-                                        self.focus = FocusTarget::Dock(idx);
-                                        match idx {
-                                            0 => bridge::open_system_settings("network"),
-                                            1 => self.open_vpn_app(),
-                                            2 => self.open_modal(ActiveModal::Search),
-                                            3 => self.open_modal(ActiveModal::Theme),
-                                            4 => self.open_modal(ActiveModal::A2ui),
-                                            5 => {
-                                                self.spawn_load_apps(ctx.clone());
-                                                self.spawn_load_status(ctx.clone());
-                                                self.spawn_load_weather(ctx.clone());
-                                                self.show_toast("Refreshed apps & live London weather");
-                                            }
-                                            6 => self.open_modal(ActiveModal::Settings),
-                                            _ => {}
-                                        }
+                                        self.focus = FocusTarget::Dock(pos);
+                                        self.trigger_dock_action(action_id, ctx);
                                     }
-                                    resp.on_hover_text(*tip);
+                                    resp.on_hover_text(tip);
                                 }
                             });
                         });
@@ -7647,6 +10119,206 @@ impl AstryxTvApp {
             self.open_modal(ActiveModal::AppContext(pkg));
         }
     }
+
+    fn draw_ambient_screensaver(&self, ctx: &egui::Context) {
+        let time_str = self.cached_time_str.clone();
+        let date_str = self.cached_date_str.clone();
+        let accent = self.config.accent();
+        let accent2 = self.config.accent2();
+        let w_line = self
+            .weather
+            .as_ref()
+            .map(|w| format!("{}  ·  {}", self.fmt_temp(w.temp_c), w.condition))
+            .unwrap_or_default();
+
+        egui::Area::new(egui::Id::new("ambient_screensaver"))
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| match self.config.screensaver_style {
+                ScreensaverStyle::Classic => {
+                    ui.vertical_centered(|ui| {
+                        ui.label(
+                            RichText::new(&time_str)
+                                .font(FontId::proportional(92.0))
+                                .strong()
+                                .color(Color32::from_rgba_unmultiplied(255, 255, 255, 238)),
+                        );
+                        ui.label(
+                            RichText::new(&date_str)
+                                .font(FontId::proportional(20.0))
+                                .color(Color32::from_rgba_unmultiplied(215, 228, 246, 200)),
+                        );
+                        if !w_line.is_empty() {
+                            ui.add_space(10.0);
+                            ui.label(
+                                RichText::new(&w_line)
+                                    .font(FontId::proportional(18.0))
+                                    .strong()
+                                    .color(accent),
+                            );
+                        }
+                    });
+                }
+
+                ScreensaverStyle::GlassCard => {
+                    egui::Frame::NONE
+                        .fill(Color32::from_rgba_unmultiplied(10, 14, 26, 188))
+                        .stroke(Stroke::new(
+                            1.5_f32,
+                            Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 145),
+                        ))
+                        .corner_radius(CornerRadius::same(28))
+                        .inner_margin(egui::Margin::symmetric(48, 34))
+                        .show(ui, |ui| {
+                            ui.vertical_centered(|ui| {
+                                ui.label(
+                                    RichText::new(&time_str)
+                                        .font(FontId::proportional(84.0))
+                                        .strong()
+                                        .color(Color32::WHITE),
+                                );
+                                ui.add_space(6.0);
+                                let (bar_r, _) =
+                                    ui.allocate_exact_size(Vec2::new(110.0, 2.0), Sense::hover());
+                                ui.painter()
+                                    .rect_filled(bar_r, CornerRadius::same(1), accent);
+                                ui.add_space(8.0);
+                                ui.label(
+                                    RichText::new(&date_str)
+                                        .font(FontId::proportional(18.5))
+                                        .color(Color32::from_rgb(208, 220, 240)),
+                                );
+                                if !w_line.is_empty() {
+                                    ui.add_space(6.0);
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "{}  ·  {}",
+                                            self.config.weather_city, w_line
+                                        ))
+                                        .font(FontId::proportional(15.5))
+                                        .strong()
+                                        .color(accent),
+                                    );
+                                }
+                            });
+                        });
+                }
+
+                ScreensaverStyle::MinimalClock => {
+                    ui.vertical_centered(|ui| {
+                        ui.label(
+                            RichText::new(&time_str)
+                                .font(FontId::proportional(118.0))
+                                .strong()
+                                .color(Color32::from_rgba_unmultiplied(255, 255, 255, 242)),
+                        );
+                    });
+                }
+
+                ScreensaverStyle::EditorialSplit => {
+                    egui::Frame::NONE
+                        .fill(Color32::from_rgba_unmultiplied(8, 12, 22, 152))
+                        .corner_radius(CornerRadius::same(24))
+                        .inner_margin(egui::Margin::symmetric(36, 24))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 22.0;
+                                ui.label(
+                                    RichText::new(&time_str)
+                                        .font(FontId::proportional(82.0))
+                                        .strong()
+                                        .color(Color32::WHITE),
+                                );
+                                let (div_r, _) =
+                                    ui.allocate_exact_size(Vec2::new(3.0, 74.0), Sense::hover());
+                                ui.painter()
+                                    .rect_filled(div_r, CornerRadius::same(2), accent);
+                                ui.vertical(|ui| {
+                                    ui.add_space(8.0);
+                                    ui.label(
+                                        RichText::new(date_str.to_uppercase())
+                                            .font(FontId::proportional(16.0))
+                                            .strong()
+                                            .color(Color32::from_rgb(226, 236, 250)),
+                                    );
+                                    ui.add_space(4.0);
+                                    ui.label(
+                                        RichText::new(&self.config.weather_city)
+                                            .font(FontId::proportional(14.5))
+                                            .color(Color32::from_rgb(164, 180, 206)),
+                                    );
+                                    if !w_line.is_empty() {
+                                        ui.add_space(4.0);
+                                        ui.label(
+                                            RichText::new(&w_line)
+                                                .font(FontId::proportional(16.5))
+                                                .strong()
+                                                .color(accent),
+                                        );
+                                    }
+                                });
+                            });
+                        });
+                }
+
+                ScreensaverStyle::NeonRing => {
+                    let dial_size = Vec2::splat(290.0);
+                    let (rect, _) = ui.allocate_exact_size(dial_size, Sense::hover());
+                    let p = ui.painter();
+                    let c = rect.center();
+                    let radius = 132.0_f32;
+                    p.circle_filled(
+                        c,
+                        radius - 6.0,
+                        Color32::from_rgba_unmultiplied(8, 12, 24, 178),
+                    );
+                    p.circle_stroke(
+                        c,
+                        radius + 6.0,
+                        Stroke::new(
+                            1.2_f32,
+                            Color32::from_rgba_unmultiplied(
+                                accent2.r(),
+                                accent2.g(),
+                                accent2.b(),
+                                85,
+                            ),
+                        ),
+                    );
+                    p.circle_stroke(
+                        c,
+                        radius,
+                        Stroke::new(
+                            2.6_f32,
+                            Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 205),
+                        ),
+                    );
+                    p.text(
+                        c + Vec2::new(0.0, -18.0),
+                        Align2::CENTER_CENTER,
+                        &time_str,
+                        FontId::proportional(58.0),
+                        Color32::WHITE,
+                    );
+                    p.text(
+                        c + Vec2::new(0.0, 24.0),
+                        Align2::CENTER_CENTER,
+                        &self.cached_date_short,
+                        FontId::proportional(15.5),
+                        Color32::from_rgb(206, 220, 242),
+                    );
+                    if !w_line.is_empty() {
+                        p.text(
+                            c + Vec2::new(0.0, 50.0),
+                            Align2::CENTER_CENTER,
+                            &w_line,
+                            FontId::proportional(14.5),
+                            accent,
+                        );
+                    }
+                }
+            });
+    }
 }
 
 impl eframe::App for AstryxTvApp {
@@ -7742,45 +10414,9 @@ impl eframe::App for AstryxTvApp {
             self.ambient_active = true;
         }
 
-        // Ambient Clock Screensaver Mode (OLED-safe gentle Lissajous pixel drift)
+        // Ambient Clock Screensaver Mode (static centered display with selectable style)
         if self.ambient_active {
-            let t = self.start_time.elapsed().as_secs_f32();
-            let shift = Vec2::new((t * 0.14).sin() * 26.0, (t * 0.11).cos() * 14.0);
-            let time_str = self.cached_time_str.clone();
-            let date_str = self.cached_date_str.clone();
-            let w_line = self
-                .weather
-                .as_ref()
-                .map(|w| format!("{}  ·  {}", self.fmt_temp(w.temp_c), w.condition))
-                .unwrap_or_default();
-
-            egui::Area::new(egui::Id::new("ambient_screensaver"))
-                .anchor(Align2::CENTER_CENTER, shift)
-                .order(egui::Order::Foreground)
-                .show(ctx, |ui| {
-                    ui.vertical_centered(|ui| {
-                        ui.label(
-                            RichText::new(&time_str)
-                                .font(FontId::proportional(92.0))
-                                .strong()
-                                .color(Color32::from_rgba_unmultiplied(255, 255, 255, 235)),
-                        );
-                        ui.label(
-                            RichText::new(&date_str)
-                                .font(FontId::proportional(20.0))
-                                .color(Color32::from_rgba_unmultiplied(215, 228, 246, 200)),
-                        );
-                        if !w_line.is_empty() {
-                            ui.add_space(10.0);
-                            ui.label(
-                                RichText::new(w_line)
-                                    .font(FontId::proportional(18.0))
-                                    .strong()
-                                    .color(self.config.accent()),
-                            );
-                        }
-                    });
-                });
+            self.draw_ambient_screensaver(ctx);
             ctx.request_repaint_after(Duration::from_millis(500));
             return;
         }
@@ -8075,6 +10711,20 @@ impl eframe::App for AstryxTvApp {
                         );
                     });
             });
+
+        // Pressing the TV remote HOME button dismisses any active modal/orb and returns cleanly to Home
+        if bridge::take_home_pressed() {
+            if self.gemini_listening {
+                let _ = bridge::stop_voice_recording();
+                self.gemini_listening = false;
+            }
+            bridge::stop_speaking();
+            self.modal_stack.clear();
+            self.modal = ActiveModal::None;
+            self.modal_close_focused = false;
+            self.ambient_active = false;
+            self.last_input_at = Instant::now();
+        }
 
         // Active modal overlay
         self.render_modals(ctx, &visible);

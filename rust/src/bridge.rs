@@ -36,6 +36,7 @@ static ANDROID_HANDLES: OnceLock<(usize, usize)> = OnceLock::new();
 static EGUI_CTX: OnceLock<egui::Context> = OnceLock::new();
 static BACK_PRESSED: AtomicBool = AtomicBool::new(false);
 static MENU_PRESSED: AtomicBool = AtomicBool::new(false);
+static HOME_PRESSED: AtomicBool = AtomicBool::new(false);
 static STATUS_REFRESH_REQUESTED: AtomicBool = AtomicBool::new(false);
 static PACKAGES_CHANGED: AtomicBool = AtomicBool::new(false);
 static IS_PAUSED: AtomicBool = AtomicBool::new(false);
@@ -58,6 +59,10 @@ pub fn take_back_pressed() -> bool {
 
 pub fn take_menu_pressed() -> bool {
     MENU_PRESSED.swap(false, Ordering::SeqCst)
+}
+
+pub fn take_home_pressed() -> bool {
+    HOME_PRESSED.swap(false, Ordering::SeqCst)
 }
 
 pub fn take_status_refresh_requested() -> bool {
@@ -85,6 +90,17 @@ pub extern "system" fn Java_com_astryxtv_rustlauncher_RustLauncherActivity_nativ
     _obj: JObject,
 ) {
     MENU_PRESSED.store(true, Ordering::SeqCst);
+    if let Some(ctx) = EGUI_CTX.get() {
+        ctx.request_repaint();
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_astryxtv_rustlauncher_RustLauncherActivity_nativeOnHomePressed(
+    _env: jni::JNIEnv,
+    _obj: JObject,
+) {
+    HOME_PRESSED.store(true, Ordering::SeqCst);
     if let Some(ctx) = EGUI_CTX.get() {
         ctx.request_repaint();
     }
@@ -527,4 +543,116 @@ pub fn install_apk(apk_path: &str) -> String {
         Some(s)
     })
     .unwrap_or_else(|| "ERR:Android JNI bridge unavailable".to_string())
+}
+
+pub fn start_voice_recording() -> String {
+    with_activity(|env, act| {
+        let val = env
+            .call_method(act, "rustStartVoiceRecording", "()Ljava/lang/String;", &[])
+            .ok()?
+            .l()
+            .ok()?;
+        let s: String = env.get_string(&JString::from(val)).ok()?.into();
+        Some(s)
+    })
+    .unwrap_or_else(|| "ERR:JNI unavailable".to_string())
+}
+
+pub fn stop_voice_recording() -> Vec<u8> {
+    with_activity(|env, act| {
+        let val = env
+            .call_method(act, "rustStopVoiceRecording", "()[B", &[])
+            .ok()?
+            .l()
+            .ok()?;
+        if val.is_null() {
+            return Some(Vec::new());
+        }
+        env.convert_byte_array(JByteArray::from(val)).ok()
+    })
+    .unwrap_or_default()
+}
+
+pub fn is_voice_recording() -> bool {
+    with_activity(|env, act| {
+        env.call_method(act, "rustIsVoiceRecording", "()Z", &[])
+            .ok()?
+            .z()
+            .ok()
+    })
+    .unwrap_or(false)
+}
+
+pub fn is_voice_auto_stopped() -> bool {
+    with_activity(|env, act| {
+        env.call_method(act, "rustIsVoiceAutoStopped", "()Z", &[])
+            .ok()?
+            .z()
+            .ok()
+    })
+    .unwrap_or(false)
+}
+
+pub fn get_voice_level() -> f32 {
+    with_activity(|env, act| {
+        env.call_method(act, "rustGetVoiceLevel", "()F", &[])
+            .ok()?
+            .f()
+            .ok()
+    })
+    .unwrap_or(0.0)
+}
+
+pub fn play_wav_bytes(wav: &[u8]) -> bool {
+    if wav.is_empty() {
+        return false;
+    }
+    with_activity(|env, act| {
+        let jbytes = env.byte_array_from_slice(wav).ok()?;
+        env.call_method(act, "rustPlayWavBytes", "([B)Z", &[JValue::Object(&jbytes)])
+            .ok()?
+            .z()
+            .ok()
+    })
+    .unwrap_or(false)
+}
+
+pub fn speak_fallback_tts(text: &str) {
+    let _ = with_activity(|env, act| {
+        let jtxt = env.new_string(text).ok()?;
+        let _ = env.call_method(
+            act,
+            "rustSpeakFallbackTts",
+            "(Ljava/lang/String;)V",
+            &[JValue::Object(&jtxt)],
+        );
+        Some(())
+    });
+}
+
+pub fn stop_speaking() {
+    let _ = with_activity(|env, act| {
+        let _ = env.call_method(act, "rustStopSpeaking", "()V", &[]);
+        Some(())
+    });
+}
+
+pub fn is_speaking() -> bool {
+    with_activity(|env, act| {
+        env.call_method(act, "rustIsSpeaking", "()Z", &[])
+            .ok()?
+            .z()
+            .ok()
+    })
+    .unwrap_or(false)
+}
+
+pub fn get_speak_level() -> f32 {
+    with_activity(|env, act| {
+        env.call_method(act, "rustGetSpeakLevel", "()F", &[])
+            .ok()?
+            .f()
+            .ok()
+    })
+    .unwrap_or(0.0)
 }
